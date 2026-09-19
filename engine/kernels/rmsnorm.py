@@ -121,3 +121,36 @@ def add_rms_norm(x, residual, weight, eps):
     warps = pick(("add_rms_norm", rows, width), 4, (1, 2, 8), launch) if rows <= 16 else 4
     launch(warps)
     return out.reshape(shape), summed.reshape(shape)
+
+
+@triton.jit
+def _embed_rms_norm_kernel(ids_ptr, table_ptr, w_ptr, y_ptr, h_ptr, n_cols, eps, BLOCK: tl.constexpr):
+    """Row = the embedding of ids[row], copied out as the residual stream and normalized like _rms_norm_kernel."""
+    pdl_wait()  # before any global memory access
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    token = tl.load(ids_ptr + row).to(tl.int64)
+    raw = tl.load(table_ptr + token * n_cols + cols, mask=mask, other=0.0)
+    tl.store(h_ptr + row * n_cols + cols, raw, mask=mask)
+    x = raw.to(tl.float32)
+    variance = tl.sum(x * x, axis=0) / n_cols
+    normed = x * tl.math.rsqrt(variance + eps)
+    weight = tl.load(w_ptr + cols, mask=mask, other=0.0)
+    tl.store(y_ptr + row * n_cols + cols, normed.to(y_ptr.dtype.element_ty) * weight, mask=mask)
+
+
+def embed_rms_norm(token_ids, table, weight, eps):
+    """(normalized, hidden) for the embedding rows of ``token_ids``: one launch instead of a gather and a norm."""
+    ids = token_ids.reshape(-1).contiguous()
+    n_cols = table.shape[1]
+    block = triton.next_power_of_2(n_cols)
+    if block > MAX_BLOCK or not table.is_contiguous() or ids.dtype != torch.int64:
+        raise ValueError("embedding rows must fit one block and the table must be contiguous")
+    hidden = torch.empty((ids.numel(), n_cols), dtype=table.dtype, device=table.device)
+    out = torch.empty_like(hidden)
+    _embed_rms_norm_kernel[(ids.numel(),)](
+        ids, table, weight, out, hidden, n_cols, eps, BLOCK=block, num_warps=4 if block <= 4096 else 8,
+    )
+    shape = (*token_ids.shape, n_cols)
+    return out.reshape(shape), hidden.reshape(shape)

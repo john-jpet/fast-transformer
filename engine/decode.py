@@ -10,7 +10,7 @@ import time
 import torch
 
 from kernels.argmax import argmax, greedy_tokens
-from kernels.rmsnorm import add_rms_norm, rms_norm
+from kernels.rmsnorm import add_rms_norm, embed_rms_norm, rms_norm
 from kernels.decode_attention import decode_attention
 from kernels.linear import keep_native, linear
 from kernels.qk_rope import qk_rope_cache
@@ -207,13 +207,21 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None, e
     Return the last token's logits [B,V], or with ``every`` all of them [B,T,V].
     """
     base = model.model
-    hidden = base.embed_tokens(token_ids)
-    residual = None
+    if cache.prefilling:
+        hidden = base.embed_tokens(token_ids)
+        residual = None
+    else:
+        # Decode steps and verify blocks: the embedding gather and the first
+        # norm are one launch (kernels/rmsnorm.py); the row copy is the residual.
+        first = base.layers[0].input_layernorm
+        normalized, residual = embed_rms_norm(token_ids, base.embed_tokens.weight, first.weight, first.variance_epsilon)
+        hidden = residual
     for index, layer in enumerate(base.layers):
         last_token_only = cache.prefilling and token_ids.shape[1] > 1 and index == len(base.layers) - 1
-        if residual is None:
-            residual = hidden
-            normalized = layer.input_layernorm(hidden)
+        if index == 0:
+            if cache.prefilling:
+                residual = hidden
+                normalized = layer.input_layernorm(hidden)
         else:
             # Complete the previous layer's MLP residual in the next layer's
             # input norm. The stored sum rounds to BF16 before normalization.
@@ -451,7 +459,7 @@ class DecodeState:
         # latency that a synchronize after every replay adds to each one.
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         times = []
-        for _ in range(3):
+        for _ in range(5):
             self.row_position.fill_(self.shape[1])
             torch.cuda.synchronize(self.device)
             start.record()
@@ -463,7 +471,11 @@ class DecodeState:
         self.row_position.fill_(self.shape[1])
         self.history.zero_()
         self.stale.fill_(-1)
-        self.pass_seconds = sorted(times)[len(times) // 2] / 1000.0
+        # The fastest reading is the pass time: the floor must be set by the
+        # pass itself, not by a clock still ramping or a neighbour's traffic
+        # (on the platform the floor-set batch-1 TPOT varied 2.86-3.39 ms for
+        # the same kernels between runs).
+        self.pass_seconds = min(times) / 1000.0
         self.pace_seconds = self.pace_floor() * self.pass_seconds
 
     def pace_floor(self):

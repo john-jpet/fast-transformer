@@ -221,3 +221,17 @@ E06 as evidence: it has the new table but excludes E03 consumers. New
 submission keeps Hopper, argmax and refinement ordering with the validated
 bare-token table. Protocol tests, restored builder checks and archive pass.
 This is a risk rollback, not a claim to have identified or fixed root cause.
+
+## E06 measured: discard combined candidate; isolate argmax on E02
+Run23b323bf (b13cbd2) passed at1084.436 vs E02 best1087.324 (-0.27%).
+Public313.663/530.929/3156.675; batch16 down2.75%, TPOT4.279 vs4.119ms.
+Aggregate difference alone is within expected noise; no demonstrated net gain.
+This tested Hopper/even splits/two-context drafts together, so cannot blame
+one component. Passing without E03 consumers narrows but does not resolve
+E04's hidden correctness failure. Canceled queued recovery ae73f83.
+Restored linear.py exactly from E02, removing Hopper/even splits and untested
+refinement priority. Current engine differs from E02 ONLY in argmax kernel
+and its three call sites. Next official run isolates token selection.
+Existing E05/E06 CPU scripts are historical and require their commit's kernels.
+10 protocol tests, archive validator and diff checks passed; argmax kernel
+unchanged from its 60 CPU cases/six SM90 compilations/two reviews.

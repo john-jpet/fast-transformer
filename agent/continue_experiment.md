@@ -99,3 +99,9 @@ Restored bare-token table from065f18f and canceled queued E07. E06 remains
 measuring with new table and without removed merge consumers. Next pushed
 commit uses best table + Hopper + argmax + refinement priority. See latest
 EXPERIMENTS_EXPERIMENT.md section for evidence and limitations.
+
+## Latest: isolate argmax after E06 result
+E06 passed1084.436, below best1087.324; no net gain, batch16 regressed2.75%.
+Canceled recovery ae73f83 while queued. Restored linear.py from065f18f.
+Next candidate = best E02 plus ONLY exact two-stage argmax. Table and all
+matrix kernels match E02. Do not stack new unmeasured changes onto this test.

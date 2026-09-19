@@ -69,40 +69,6 @@ def _skinny_gemm(
 
 
 @triton.jit
-def _hopper_gemm(
-    x_ptr, weight_ptr, out_ptr,
-    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
-    SPLITS: tl.constexpr, CHUNK: tl.constexpr,
-    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_M: tl.constexpr = 16,
-):
-    # Weight is the left operand: a 64-row tile unlocks SM90 WGMMA even
-    # when the logical batch has only 16 rows. Output stays [split,M,N].
-    rows = tl.arange(0, BLOCK_M)
-    columns = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
-    if N * K + SPLITS * M * N + 2 * BLOCK_N * (K + M) >= 2 ** 31:
-        columns = columns.to(tl.int64)
-    split = tl.program_id(1)
-    reduction = tl.arange(0, BLOCK_K)
-    acc = tl.zeros((BLOCK_N, BLOCK_M), tl.float32)
-    for start in range(split * CHUNK, (split + 1) * CHUNK, BLOCK_K):
-        k = start + reduction
-        weight = tl.load(
-            weight_ptr + columns[:, None] * K + k[None, :],
-            (columns[:, None] < N) & (k[None, :] < K), other=0,
-        )
-        x = tl.load(
-            x_ptr + rows[None, :] * K + k[:, None],
-            (rows[None, :] < M) & (k[:, None] < K), other=0,
-        )
-        acc = tl.dot(weight, x, acc)
-    tl.store(
-        out_ptr + split * M * N + rows[None, :] * N + columns[:, None], acc,
-        (rows[None, :] < M) & (columns[:, None] < N),
-    )
-
-
-@triton.jit
 def _merge_projection(
     partial_ptr, out_ptr, COUNT: tl.constexpr, SPLITS: tl.constexpr,
     BLOCK_S: tl.constexpr, BLOCK: tl.constexpr,
@@ -129,8 +95,7 @@ def _project(x, weight, config):
             BLOCK_N=block_n, BLOCK_K=block_k, num_warps=warps,
         )
     else:
-        kernel = _hopper_gemm if kind == "hopper" else _skinny_gemm
-        kernel[(triton.cdiv(n, block_n), splits)](
+        _skinny_gemm[(triton.cdiv(n, block_n), splits)](
             x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=16 if m <= 16 else 32,
             num_warps=warps, num_stages=2,
@@ -186,17 +151,6 @@ def _candidates(m, n, k):
     if m == 1:
         configs += [("gemv", 8, 512, 1, 4), ("gemv", 16, 256, 1, 4)]
     elif m > 4:
-        # Compare an even partition of K with the established power-of-two
-        # splits, keeping the kernel and tile unchanged. QKV K=2560 has 20
-        # 128-wide blocks: five splits use all blocks instead of padding to 24.
-        base = configs[0]
-        blocks = k // base[2]
-        if k % base[2] == 0:
-            exact = max(s for s in range(1, base[3] + 1) if blocks % s == 0)
-            aligned = (base[0], base[1], base[2], exact, base[4])
-            if aligned != base:
-                configs.append(aligned)
-            configs.append(("hopper", base[1], base[2], exact, base[4]))
         # Verify blocks fill most of the 16/32 input rows, so every tile reloads
         # a large x block: wider output tiles amortize it. Judged in the real
         # verify graph (DecodeState.refine), not only in isolation.
@@ -263,11 +217,7 @@ def linear(x, weight):
         _CHOICES[key] = _choose(flat, weight)
         # None is cuBLAS. The captured decode step re-judges these layouts.
         register(
-            # The vocabulary head runs once; layer projections run 36 times.
-            # Use equivalent per-layer traffic to preserve the priority scale
-            # shared with the gated projection's separate refinement knob.
-            ("projection",) + key[1:], rows,
-            weight.numel() // (36 if weight.shape[0] == 151936 else 1),
+            ("projection",) + key[1:], rows, weight.shape[0] * weight.shape[1],
             [config for _, config in sorted(_VALIDATED.get(key, ()), key=lambda item: item[0])],
             lambda: _CHOICES[key], lambda config: _CHOICES.__setitem__(key, config),
         )

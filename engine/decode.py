@@ -542,10 +542,19 @@ class DecodeState:
         best = self.pass_seconds
         ordered = knobs(self.shape[0] * self.block_size)
         captured = [knob.get() for knob in ordered]
-        for knob in ordered:
+        for index, knob in enumerate(ordered):
+            # Each knob gets its share of what is left, instead of all of them
+            # racing one deadline. Knobs are ordered by expected effect, and the
+            # heavy ones come first because their options recompile a kernel, so
+            # a single deadline was spent entirely on the head of the list and
+            # the compile-free knobs at the tail - the fused argmax, the launch
+            # widths - were never judged on any workload. An option that has
+            # already started still runs to the end, so every knob gets at least
+            # one trial, and time a knob does not use rolls into the next share.
+            share = time.monotonic() + (deadline - time.monotonic()) / (len(ordered) - index)
             chosen = knob.get()
             for option in knob.options:
-                if option == chosen or time.monotonic() >= deadline:
+                if option == chosen or time.monotonic() >= share:
                     continue
                 knob.select(option)
                 # Libraries and streams are warm by now: one eager pass is

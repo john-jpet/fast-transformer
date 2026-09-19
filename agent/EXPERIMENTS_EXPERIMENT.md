@@ -145,3 +145,31 @@ specializations, merged-consumer compile coverage extended to five splits,
 32 consumer CPU cases, gated merge BS padding compiled for five splits.
 The independent review recommended isolating this partition change from the
 competitor's mask-free and transposed kernels. No kernel bodies changed.
+
+## E06 — transposed skinny GEMM to unlock Hopper WGMMA (held)
+
+Offline SM90 inspection of the competing source verifies a concrete codegen
+difference: for M16, ordinary/exact tiles emit 16 mma.sync instructions and
+zero WGMMA; transposed tiles emit 8 wgmma.mma_async and zero mma.sync. At M32
+the ordinary tile has 32 MMA versus 8 WGMMA for transpose. Shared memory stays
+20/24 KiB, no PTX local declarations in those tested shapes. These are static
+instruction counts, not timing claims.
+
+Implement the transposed operand formulation in our existing linear module,
+retain all masks and the established [split,M,N] output. Offer it alongside
+our E05 even-split ordinary GEMM. No weight relayout, no new output rounding.
+This is distinct from E05 and will be held until a queue slot is available.
+Unlike the competing emulator, our check must follow the transposed [N,M]
+accumulator and actual transposed stores. Expected signal: projection-dominated
+TPOT; could lose if memory bandwidth already dominates or stores get worse.
+
+E06 local checks passed: explicit transposed accumulation/store emulation,
+eight SM90 specializations (FP32 partial and direct BF16 outputs), 10 existing
+tests, archive validator, two independent static reviews. No speed claim yet.
+
+E03 result: 1073.276 tokens/s (-1.29% vs E02 best), all gates passed.
+Public rates 304.0/528.3/3219.5 versus E02 307.4/527.5/3245.9; no compensating
+public signal. Discard merge-free consumers on our stack. User specifically
+asked to prioritize beating the previous benchmark. E04 may finish to isolate
+the draft table's effect; cancel queued E05 as superseded, then test Hopper
+with two-context drafts and even splits but without E03 merge consumers.

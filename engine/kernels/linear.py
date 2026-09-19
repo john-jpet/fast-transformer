@@ -70,6 +70,40 @@ def _skinny_gemm(
 
 
 @triton.jit
+def _hopper_gemm(
+    x_ptr, weight_ptr, out_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    SPLITS: tl.constexpr, CHUNK: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    BLOCK_M: tl.constexpr = 16,
+):
+    # Weight is the left operand: a 64-row tile unlocks SM90 WGMMA even
+    # when the logical batch has only 16 rows. Output stays [split,M,N].
+    rows = tl.arange(0, BLOCK_M)
+    columns = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
+    if N * K + SPLITS * M * N + 2 * BLOCK_N * (K + M) >= 2 ** 31:
+        columns = columns.to(tl.int64)
+    split = tl.program_id(1)
+    reduction = tl.arange(0, BLOCK_K)
+    acc = tl.zeros((BLOCK_N, BLOCK_M), tl.float32)
+    for start in range(split * CHUNK, (split + 1) * CHUNK, BLOCK_K):
+        k = start + reduction
+        weight = tl.load(
+            weight_ptr + columns[:, None] * K + k[None, :],
+            (columns[:, None] < N) & (k[None, :] < K), other=0,
+        )
+        x = tl.load(
+            x_ptr + rows[None, :] * K + k[:, None],
+            (rows[None, :] < M) & (k[:, None] < K), other=0,
+        )
+        acc = tl.dot(weight, x, acc)
+    tl.store(
+        out_ptr + split * M * N + rows[None, :] * N + columns[:, None], acc,
+        (rows[None, :] < M) & (columns[:, None] < N),
+    )
+
+
+@triton.jit
 def _merge_projection(
     partial_ptr, out_ptr, COUNT: tl.constexpr, SPLITS: tl.constexpr,
     BLOCK_S: tl.constexpr, BLOCK: tl.constexpr,
@@ -96,7 +130,8 @@ def _project(x, weight, config, split_ok=False):
             BLOCK_N=block_n, BLOCK_K=block_k, num_warps=warps,
         )
     else:
-        _skinny_gemm[(triton.cdiv(n, block_n), splits)](
+        kernel = _hopper_gemm if kind == "hopper" else _skinny_gemm
+        kernel[(triton.cdiv(n, block_n), splits)](
             x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=16 if m <= 16 else 32,
             num_warps=warps, num_stages=2,
@@ -164,6 +199,7 @@ def _candidates(m, n, k):
             aligned = (base[0], base[1], base[2], exact, base[4])
             if aligned != base:
                 configs.append(aligned)
+            configs.append(("hopper", base[1], base[2], exact, base[4]))
         # Verify blocks fill most of the 16/32 input rows, so every tile reloads
         # a large x block: wider output tiles amortize it. Judged in the real
         # verify graph (DecodeState.refine), not only in isolation.

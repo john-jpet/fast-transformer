@@ -272,7 +272,6 @@ class DecodeState:
         self.capture_prefill()
         if self.speculative:
             self.choose_block(model, weight)
-            self.refine()
         elif output_length > 1:
             self.capture()
 
@@ -313,10 +312,12 @@ class DecodeState:
         # Unpaced seconds per token of earlier generations in this process.
         self.natural, self.finished, self.generations = [], None, 0
         layer = model.model.layers[0]
+        # Tuning budget in order of weight traffic per pass: the vocabulary
+        # projection runs once, the others once per layer.
         for projection in (
             layer.mlp.gate_up_weight, layer.mlp.down_proj.weight,
-            model.lm_head.weight, layer.self_attn.qkv_weight,
-            layer.self_attn.o_proj.weight,
+            layer.self_attn.qkv_weight, layer.self_attn.o_proj.weight,
+            model.lm_head.weight,
         ):
             linear(projection.new_zeros((batch, tokens, projection.shape[1])), projection)
         hidden = weight.new_zeros((batch, tokens, weight.shape[1]))
@@ -382,8 +383,13 @@ class DecodeState:
         much more depends on the batch and the context length (attention work
         scales with the block). Score = measured pass time x expected passes
         per token. Shape-only: decided once at warmup, before any sample.
+        Each size is compared AFTER its graph was refined, on a share of the
+        refinement budget: an untuned layout must not eliminate the faster
+        size (idea from the Silver Bullet fork, with their consent). The
+        refined layouts are keyed by row count, so the winner keeps them.
         """
         long_output = self.shape[2] >= LONG_OUTPUT
+        seconds = 8.0 / len(self.candidates)  # every refine call may overrun by one option
         best = None
         for size in (*self.candidates, None):
             if size is None:
@@ -394,6 +400,8 @@ class DecodeState:
                 self.block_size, self.drafts_by_match = size, DRAFTS_BY_MATCH[size]
                 self.prepare_speculation(model, weight)
             self.capture_speculation()
+            if best is None or size != best[1]:
+                self.refine(seconds)
             cost = self.pass_seconds * EXPECTED_PASSES[size][long_output]
             if best is None or cost < best[0]:
                 best = (cost, size)

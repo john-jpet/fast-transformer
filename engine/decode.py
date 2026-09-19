@@ -312,12 +312,10 @@ class DecodeState:
         # Unpaced seconds per token of earlier generations in this process.
         self.natural, self.finished, self.generations = [], None, 0
         layer = model.model.layers[0]
-        # Tuning budget in order of weight traffic per pass: the vocabulary
-        # projection runs once, the others once per layer.
         for projection in (
             layer.mlp.gate_up_weight, layer.mlp.down_proj.weight,
-            layer.self_attn.qkv_weight, layer.self_attn.o_proj.weight,
-            model.lm_head.weight,
+            model.lm_head.weight, layer.self_attn.qkv_weight,
+            layer.self_attn.o_proj.weight,
         ):
             linear(projection.new_zeros((batch, tokens, projection.shape[1])), projection)
         hidden = weight.new_zeros((batch, tokens, weight.shape[1]))

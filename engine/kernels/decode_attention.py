@@ -38,21 +38,7 @@ def _decode_partials(
     denominator = tl.zeros((BLOCK_M,), tl.float32)
     accumulator = tl.zeros((BLOCK_M, DIM), tl.float32)
     cache_base = group * CAPACITY * DIM
-    # Whole tiles below ``end`` need no masks; only the last tile is ragged.
-    whole = begin + tl.maximum(end - begin, 0) // BLOCK_N * BLOCK_N
-    for start in range(begin, whole, BLOCK_N):
-        tokens = start + columns
-        key = tl.load(k_ptr + cache_base + tokens[None, :] * DIM + dims[:, None])
-        scores = tl.dot(query, key) * (SCALE * 1.4426950408889634)
-        next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
-        probabilities = tl.exp2(scores - next_maximum[:, None])
-        correction = tl.exp2(maximum - next_maximum)
-        denominator = denominator * correction + tl.sum(probabilities, axis=1)
-        accumulator = accumulator * correction[:, None]
-        value = tl.load(v_ptr + cache_base + tokens[:, None] * DIM + dims[None, :])
-        accumulator = tl.dot(probabilities.to(tl.bfloat16), value, accumulator)
-        maximum = next_maximum
-    for start in range(whole, end, BLOCK_N):
+    for start in range(begin, end, BLOCK_N):
         tokens = start + columns
         key = tl.load(
             k_ptr + cache_base + tokens[None, :] * DIM + dims[:, None],
@@ -268,22 +254,7 @@ def _block_partials(
     denominator = tl.zeros((BLOCK_M,), tl.float32)
     accumulator = tl.zeros((BLOCK_M, DIM), tl.float32)
     cache_base = group * CAPACITY * DIM
-    # Tiles wholly inside the known prefix are visible to every query of the
-    # block: no load masks, no visibility select. Same values, same order.
-    whole = begin + tl.maximum(tl.minimum(end, first) - begin, 0) // BLOCK_N * BLOCK_N
-    for start in range(begin, whole, BLOCK_N):
-        tokens = start + columns
-        key = tl.load(k_ptr + cache_base + tokens[None, :] * DIM + dims[:, None])
-        scores = tl.dot(query, key) * (SCALE * 1.4426950408889634)
-        next_maximum = tl.maximum(maximum, tl.max(scores, axis=1))
-        probabilities = tl.exp2(scores - next_maximum[:, None])
-        correction = tl.exp2(maximum - next_maximum)
-        denominator = denominator * correction + tl.sum(probabilities, axis=1)
-        accumulator = accumulator * correction[:, None]
-        value = tl.load(v_ptr + cache_base + tokens[:, None] * DIM + dims[None, :])
-        accumulator = tl.dot(probabilities.to(tl.bfloat16), value, accumulator)
-        maximum = next_maximum
-    for start in range(whole, end, BLOCK_N):
+    for start in range(begin, end, BLOCK_N):
         tokens = start + columns
         key = tl.load(
             k_ptr + cache_base + tokens[None, :] * DIM + dims[:, None],

@@ -1,6 +1,13 @@
 """BF16 Qwen3 with a reusable KV cache and one CUDA graph per decode shape."""
 
 import gc
+import os
+
+# cuBLAS takes its workspace from PyTorch, whose default (about 8 MiB) is below
+# the 32 MiB NVIDIA recommends for Hopper-native GEMM algorithms. Read when the
+# first handle is created, so set it before any matmul. Exact arithmetic class:
+# only the algorithm cuBLAS may pick changes.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":32768:2")
 
 import torch
 from transformers import AutoModelForCausalLM

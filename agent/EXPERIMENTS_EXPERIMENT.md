@@ -179,3 +179,15 @@ decode.py, layers.py, qk_rope.py and rmsnorm.py exactly from best E02 and remove
 Split plumbing/unused engine module. Current runtime diff vs best E02 consists
 only of linear.py (even splits + Hopper option) and speculate.py (two-context
 table). Standard tests and official archive validation pass after rollback.
+
+
+## E07: two-stage exact vocabulary argmax
+
+Hypothesis: replacing the generic 151936-column indexed reduction with
+a block reduction and a small final reduction lowers verify-pass latency,
+visible in public TPOT. Ported the independent a787855 reduction; LM-head
+projection and BF16 rounding are unchanged. Also used for prefill.
+60 CPU exact-index cases cover within/across-block ties, infinity, all
+negative/infinite logits, final-entry maxima and ragged tails. Six SM90
+variants compiled; 10 protocol tests and archive validation passed.
+No measured speed claim; comparison base is E06.

@@ -11,7 +11,10 @@ from speculate import successor_table
 
 #: Decode steps enqueued beyond the one being read. Bounded, so an abandoned
 #: generator leaves little work behind and the launch queue stays shallow.
-LOOKAHEAD = 4
+# Keep a little more decode work resident so host-side token reads do not
+# expose launch gaps. This changes scheduling only; graph inputs and tokens
+# remain identical.
+LOOKAHEAD = 6
 
 
 class Engine:

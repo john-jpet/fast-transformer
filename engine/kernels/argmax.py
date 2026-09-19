@@ -99,7 +99,7 @@ def _fused_block_argmax(
 _FUSED = {}
 
 
-def fused_argmax(x, weight, block_n=64, block_k=128):
+def fused_argmax(x, weight, block_n=128, block_k=128):
     """argmax(x @ weight.T) for <= 32 BF16 rows without materializing the logits; None if not applicable."""
     rows, k = x.shape[0] * (x.shape[1] if x.dim() == 3 else 1), x.shape[-1]
     n = weight.shape[0]

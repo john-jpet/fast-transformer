@@ -105,3 +105,10 @@ E06 passed1084.436, below best1087.324; no net gain, batch16 regressed2.75%.
 Canceled recovery ae73f83 while queued. Restored linear.py from065f18f.
 Next candidate = best E02 plus ONLY exact two-stage argmax. Table and all
 matrix kernels match E02. Do not stack new unmeasured changes onto this test.
+
+## Latest E10 / fused prototype
+Argmax3d9b781 still queued; next submission isolates prefill cuDNN selection
+on best E02 (ONLY attention.py differs). No argmax in this candidate.
+New unsubmitted fused-attention prototype in agent/lab compiles four SM90
+sizes; needs numerical/pointer/cache checks and reviews before engine integration.
+No measured architecture gain yet. See latest experiment sections.

@@ -235,3 +235,29 @@ and its three call sites. Next official run isolates token selection.
 Existing E05/E06 CPU scripts are historical and require their commit's kernels.
 10 protocol tests, archive validator and diff checks passed; argmax kernel
 unchanged from its 60 CPU cases/six SM90 compilations/two reviews.
+
+## E10 isolated prefill backend experiment
+Compare cuDNN vs existing Flash GQA in causal prefill. Based on rival aeadef2,
+with stricter selection: matching tensor strides, three numerical probe scales,
+CUDA graph timing, capture on actual caller storage, Flash timing recheck,
+5% speed threshold, permanent Flash fallback. Zero-dropout causal calls only.
+This is an operator screen; official GPU validation still decides correctness.
+Two reviews completed: architecture review no concrete blocker; CLI review
+raised GPU validation limitations and probe/key concerns. Addressed causal/
+dropout guard, multiple probes, actual-buffer capture. Existing masked paths
+are unchanged. CPU tests validate selection control flow, not GPU numerics.
+10 protocol tests, six backend cases, cache/capture guard, archive pass.
+ISOLATED against E02: only engine/attention.py differs from065f18f.
+Argmax remains in its separately queued3d9b781; not discarded before measurement.
+
+## Architecture prototype: fused QK/RoPE/cache + unsplit tree attention
+Unsubmitted source and builder under agent/lab. One CTA owns each row/KV head;
+history reads strictly precede position; fresh K/V computed from packed QKV
+and consumed locally, then uniquely stored. No cross-CTA dependence. Uses
+existing tree masks and all BF16 rounding boundaries. Four SM90 compilations
+(T2/4/8/16) pass; shared22/22/28/32KiB, no PTX .local declarations. This is
+not a runtime register-spill or performance measurement. Next: independent
+line-by-line pointer/cast/cache emulation, adversarial review, full-model
+validation and bounded optional selection alongside split attention.
+Leader now Silver Bullet1103.988; SSS1097.653 (new6334ff5, +0.23% over prior,
+817s whole run). Their marginal gain alone does not establish a superior path.

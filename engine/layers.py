@@ -35,12 +35,12 @@ class PackedAttention(torch.nn.Module):
         output_shape = (input_shape[0], 1) if last_token_only else input_shape
         assert not last_token_only or (past_key_value is not None and past_key_value.prefilling)
         head_shape = (*input_shape, -1, self.head_dim)
-        block = past_key_value is not None and not past_key_value.prefilling and hidden_states.shape[1] > 1
-        packed = linear(hidden_states, self.qkv_weight, split_ok=block)
+        packed = linear(hidden_states, self.qkv_weight)
         cos, sin = position_embeddings
         if past_key_value is not None:
             key = past_key_value.keys[self.layer_idx]
             value = past_key_value.values[self.layer_idx]
+            block = not past_key_value.prefilling and hidden_states.shape[1] > 1
             query = qk_rope_cache(
                 packed, self.q_norm, self.k_norm, cos, sin, cache_position,
                 key, value, self.q_width // self.head_dim,
@@ -76,7 +76,7 @@ class PackedAttention(torch.nn.Module):
             attention, _ = grouped_sdpa(
                 self, query, key, value, attention_mask, scaling=self.scaling, dropout=0.0
             )
-        return linear(attention.reshape(*output_shape, -1).contiguous(), self.o_proj.weight, split_ok=block), None
+        return linear(attention.reshape(*output_shape, -1).contiguous(), self.o_proj.weight), None
 
 
 class PackedMLP(torch.nn.Module):
@@ -89,5 +89,5 @@ class PackedMLP(torch.nn.Module):
         self.down_proj = reference.down_proj
         self.train(reference.training)
 
-    def forward(self, hidden_states, split_ok=False):
-        return linear(gated_linear(hidden_states, self.gate_up_weight), self.down_proj.weight, split_ok=split_ok)
+    def forward(self, hidden_states):
+        return linear(gated_linear(hidden_states, self.gate_up_weight), self.down_proj.weight)

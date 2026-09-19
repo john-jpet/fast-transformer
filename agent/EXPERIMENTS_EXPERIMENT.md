@@ -173,3 +173,9 @@ public signal. Discard merge-free consumers on our stack. User specifically
 asked to prioritize beating the previous benchmark. E04 may finish to isolate
 the draft table's effect; cancel queued E05 as superseded, then test Hopper
 with two-context drafts and even splits but without E03 merge consumers.
+
+E05 queued run a4346a68 canceled before execution. E06 rollback restores
+decode.py, layers.py, qk_rope.py and rmsnorm.py exactly from best E02 and removes
+Split plumbing/unused engine module. Current runtime diff vs best E02 consists
+only of linear.py (even splits + Hopper option) and speculate.py (two-context
+table). Standard tests and official archive validation pass after rollback.

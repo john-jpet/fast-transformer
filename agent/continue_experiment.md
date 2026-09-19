@@ -28,6 +28,20 @@ other agent on origin/main. Autoresearch skill is `.claude/skills/autoresearch`.
   85 coverage cases, SM90 GEMM and five-split consumers compile; CPU tests pass.
   Do not claim it helps until measured. Keep at most two queued candidates.
 
+## Latest decision (16:57 UTC)
+
+E03 passed but regressed to 1073.276 vs best E02 1087.324. User called out
+the regression. Removed all E03 engine plumbing in a new commit, retaining
+the best E02 MLP/attention path. E04 still measuring; queued E05 run a4346a68
+was canceled as superseded. Never reset history.
+
+E06 Hopper WGMMA candidate cf10fbc is locally validated and combined with
+the E03 rollback for the next push; it retains E04's two-context table and
+E05's even splits. Current engine differs from best E02 only in linear.py
+and speculate.py. Eight SM90 variants, transposed CPU index/store checks,
+two reviews and standard tests/validator passed. No performance claim yet.
+Research scratch agent/lab remains outside engine and untracked.
+
 ## E01 candidate
 
 Fused gate/up projection with SwiGLU epilogue, plus split-K merge activation.

@@ -127,3 +127,21 @@ E04 checks passed: real successor_table builder tested on CPU fake model for
 eight vocabulary/chunk combinations, including partial final chunks and both
 contexts; score difference from summed log probabilities is a row constant.
 All 10 protocol/client tests and archive validation passed. No new Triton code.
+
+## E05 — even K partitions in the existing skinny GEMM (held)
+
+Competitor's unmeasured exact/transposed kernels suggest a narrower experiment:
+offer an evenly dividing split count for the existing 64x128 GEMM tile, alongside
+its current power-of-two split count. QKV K=2560 has 20 K tiles: 5 splits remove
+4 padded iterations and 37.5% of partials compared with 8 splits. Down K=9728
+uses 4 instead of 8 splits, halving partials but possibly reducing occupancy.
+Warmup and whole-pass refinement decide, with the old configuration retained.
+No new kernel algorithm, operand transpose, mask specialization, or layout
+inheritance. Expected effect: incremental TPOT improvement if less partial
+traffic pays. Same BF16 boundaries; split reduction ordering can differ.
+
+E05 validation: 85 real-candidate K-coverage cases, four added GEMM SM90
+specializations, merged-consumer compile coverage extended to five splits,
+32 consumer CPU cases, gated merge BS padding compiled for five splits.
+The independent review recommended isolating this partition change from the
+competitor's mask-free and transposed kernels. No kernel bodies changed.

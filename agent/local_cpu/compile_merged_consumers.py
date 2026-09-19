@@ -6,7 +6,7 @@ from offline_compile import compile_kernel
 from kernels.rmsnorm import _add_rms_norm_kernel
 from kernels.qk_rope import _qk_rope_cache
 
-for splits, dtype in ((1, "*bf16"), (2, "*fp32"), (4, "*fp32"), (8, "*fp32")):
+for splits, dtype in ((1, "*bf16"), (2, "*fp32"), (4, "*fp32"), (5, "*fp32"), (8, "*fp32")):
     for warps in (1, 4, 8):
         compile_kernel(
             _add_rms_norm_kernel,

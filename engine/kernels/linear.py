@@ -154,6 +154,16 @@ def _candidates(m, n, k):
     if m == 1:
         configs += [("gemv", 8, 512, 1, 4), ("gemv", 16, 256, 1, 4)]
     elif m > 4:
+        # Compare an even partition of K with the established power-of-two
+        # splits, keeping the kernel and tile unchanged. QKV K=2560 has 20
+        # 128-wide blocks: five splits use all blocks instead of padding to 24.
+        base = configs[0]
+        blocks = k // base[2]
+        if k % base[2] == 0:
+            exact = max(s for s in range(1, base[3] + 1) if blocks % s == 0)
+            aligned = (base[0], base[1], base[2], exact, base[4])
+            if aligned != base:
+                configs.append(aligned)
         # Verify blocks fill most of the 16/32 input rows, so every tile reloads
         # a large x block: wider output tiles amortize it. Judged in the real
         # verify graph (DecodeState.refine), not only in isolation.

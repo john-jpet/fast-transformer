@@ -21,7 +21,7 @@ torch.manual_seed(17)
 cases = 0
 for batch, tokens in ((1, 16), (4, 4), (3, 5), (16, 2)):
     rows = batch * tokens
-    for splits in (2, 4, 8):
+    for splits in (2, 4, 5, 8):
         for width in (2560, 6144):
             # Dyadic partials give exact FP32 sums, isolating indexing/casts
             # from allowed differences between FP32 reduction trees.

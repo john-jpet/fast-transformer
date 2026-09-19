@@ -23,6 +23,10 @@ other agent on origin/main. Autoresearch skill is `.claude/skills/autoresearch`.
 - E03 baf1417: run 84039458-8d32-4c78-9b0e-97c6c50dea21 preparing;
   watcher writes watch_e03.log. E04 adds two-context successor table, raw
   logit ranking and last-only LM-head during table construction. CPU checks pass.
+- E04 1868a44: run e43aec8c-a2aa-40e0-a51d-6dc28e8405aa queued.
+- E05 offers even split counts for existing GEMM, no new kernel bodies.
+  85 coverage cases, SM90 GEMM and five-split consumers compile; CPU tests pass.
+  Do not claim it helps until measured. Keep at most two queued candidates.
 
 ## E01 candidate
 

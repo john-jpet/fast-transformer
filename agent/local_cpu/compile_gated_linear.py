@@ -19,10 +19,10 @@ for m, bm, bn, bk, warps in (
     # Inspect generated PTX for the explicit round-to-BF16 boundaries.
     assert "bf16" in kernel.asm["ptx"]
 
-for m, splits in ((1, 2), (16, 2), (16, 8), (32, 4)):
+for m, splits in ((1, 2), (16, 2), (16, 5), (16, 8), (32, 4)):
     compile_kernel(
         _merge_activate, {"partial_ptr": "*fp32", "out_ptr": "*bf16"},
-        {"M": m, "I": 9728, "SPLITS": splits, "BS": splits, "BLOCK": 512},
+        {"M": m, "I": 9728, "SPLITS": splits, "BS": 1 << (splits - 1).bit_length(), "BLOCK": 512},
         num_warps=4,
     )
 print("gated projection and merge epilogues compile for cuda:90")

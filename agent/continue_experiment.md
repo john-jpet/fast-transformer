@@ -119,3 +119,9 @@ SSS c096f57 (1129.718) exactly, to test complete integrated baseline.
 Silver best384edb3=1103.988 is essentially previous SSS baseline; later
 refine-before-compare lost and was reverted. Preserve clear attribution.
 C11 CPU/tree+SM90 checks pass. Fused prototype deferred (compile cost).
+
+## Latest E12 and fused-head prototype
+Keep0791da9 queued/running per user. E12 isolates mask-free whole-prefix
+attention on it. All local checks and two reviews pass. New fused-head
+prototype compiles but stays under agent/lab; next validate rounded argmax
+and pointers before integrating. User explicitly allows multiple queued runs.

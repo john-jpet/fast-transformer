@@ -282,3 +282,28 @@ Fused-attention prototype deferred: rival independently reports excessive
 compile/warmup cost and limited application to unsplit attention. Next advance
 should start from this measured integrated baseline if our run confirms it.
 Standalone Codex review completed: exact snapshot verified, no concrete regression in block selection, stale reset or generator GC finalization.
+
+## E12: isolated whole-prefix attention loops on E11
+0791da9 left queued, untouched. Current candidate takes ONLY decode_attention.py
+from ee1f900: whole tiles wholly within visible prefix omit load/visibility
+masks; original masked loop handles tails. Competitor bundled this with other
+unmeasured tuning changes; our run isolates attention on c096f57/E11.
+6448 boundary configurations prove tile-order and removed predicates; four
+verify + three plain SM90 variants compile. Both read-only reviews found no
+concrete blocker. 10 protocol tests, archive and diff checks pass. GPU timing
+and numerical output remain to be measured; no gain claimed.
+
+## Next architecture: fused LM head/token selection, unsubmitted
+agent/lab/build_fused_head.py derives a prototype from existing exact GEMM.
+Each complete vocabulary tile rounds logits to BF16, emits maximum+lowest
+index, then a final reduction can select across tiles. No split-K partial
+argmax allowed. T16/T32 and ragged T5/N151939 compile,20/24KiB shared,
+no PTX local declarations. Weight reads unchanged (~778MB); saves full-logit
+materialization (~9.7MB at16 rows) and separate generic reduction. Numerical
+pointer/tie checks, complete-operation warmup comparison, reviews and engine
+integration still required. This is NOT submitted source.
+Other paths evaluated: final-layer historical Q elimination saves only~0.29%
+of prefill projection arithmetic; deprioritized. Large workspace measured
+regression by SSS (1111.9 vs1129.7); do not repeat. Silver's extra selection
+lost; do not blindly port latest tips. Larger decoder rewrites need evidence
+of compute/traffic savings rather than assuming fewer kernels wins.

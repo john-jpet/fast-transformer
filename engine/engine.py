@@ -1,7 +1,4 @@
-"""BF16 Qwen3 with a reusable KV cache and one CUDA graph per decode shape.
-
-Verified SSS winner rerun: behavior is intentionally unchanged.
-"""
+"""BF16 Qwen3 with a reusable KV cache and one CUDA graph per decode shape."""
 
 import gc
 

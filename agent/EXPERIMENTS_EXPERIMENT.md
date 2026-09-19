@@ -47,3 +47,29 @@ Review fixes: release the unused baseline activation tensor during tuning;
 prioritize the fused gate/up choice ahead of its generic projection choice.
 Both dense and skinny tuners have separate soft 12-second budgets. Full-model
 correctness, benefit, and warmup headroom remain for the official run.
+
+## E02 — single-pass or split dense verification attention
+
+Hypothesis: the block verifier always uses the single-token split-KV policy,
+even though one program now handles all draft queries in a KV group. This
+can allocate too many partials and use small attention tiles. Add a single-pass
+variant which normalizes and writes final outputs directly when no split is
+needed, eliminating the second kernel. Compare with the existing split path
+and larger tiles during warmup, using random finite Q/K/V and the same tree
+mask. All valid keys remain present. Register agreeing options for whole-pass
+refinement. Expected signal: lower public-1/2 TPOT, with public-0 pass time
+and pacing also benefiting if the reduced overhead pays.
+
+This candidate stacks on E01 while its official run is queued. Keep the default
+as fallback; no change to draft policy or cache ownership. Risks: different
+softmax reduction ordering, insufficient occupancy for unsplit attention, and
+extra warmup. Verify direct output indexing and empty splits on CPU and compile
+both single/split specializations for SM90 before submission.
+
+E02 local validation passed: 10 protocol/client tests, direct and split tree
+attention CPU reference comparisons (position zero, empty intervals, poisoned
+unused slots), 16 SM90 compilation cases, official archive validation. Both
+read-only reviews found no concrete blocker; their probe-coverage comment was
+addressed by checking all-full chains, all-alternative trees, and mixed rows
+with varying positions. The existing compile_spec.py signature was updated.
+GPU correctness and warmup/throughput remain unmeasured.

@@ -217,7 +217,7 @@ def decode_attention(query, key, value, position, scale):
 
 @triton.jit
 def _block_partials(
-    q_ptr, k_ptr, v_ptr, position_ptr, chain_ptr, partial_ptr, stats_ptr,
+    q_ptr, k_ptr, v_ptr, position_ptr, chain_ptr, partial_ptr, stats_ptr, out_ptr,
     TOKENS: tl.constexpr, GROUPS: tl.constexpr, Q_HEADS: tl.constexpr, KV_HEADS: tl.constexpr,
     DIM: tl.constexpr, CAPACITY: tl.constexpr, SPLITS: tl.constexpr, CHUNK: tl.constexpr,
     SCALE: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -275,10 +275,16 @@ def _block_partials(
         )
         accumulator = tl.dot(probabilities.to(tl.bfloat16), value, accumulator)
         maximum = next_maximum
-    slot = (group * SPLITS + split) * (TOKENS * GROUPS) + members
-    tl.store(partial_ptr + slot[:, None] * DIM + dims[None, :], accumulator, live[:, None])
-    tl.store(stats_ptr + slot * 2, maximum, live)
-    tl.store(stats_ptr + slot * 2 + 1, denominator, live)
+    if SPLITS == 1:
+        # The whole prefix was reduced in this program. Write token-major
+        # final values directly, without partial storage or a merge launch.
+        tl.store(out_ptr + q_offset[:, None] + dims[None, :],
+                 accumulator / denominator[:, None], live[:, None])
+    else:
+        slot = (group * SPLITS + split) * (TOKENS * GROUPS) + members
+        tl.store(partial_ptr + slot[:, None] * DIM + dims[None, :], accumulator, live[:, None])
+        tl.store(stats_ptr + slot * 2, maximum, live)
+        tl.store(stats_ptr + slot * 2 + 1, denominator, live)
 
 
 @triton.jit
@@ -306,13 +312,84 @@ def _block_merge(
     tl.store(out_ptr + index * DIM + dims, numerator / denominator)
 
 
-def block_attention(query, key, value, position, scale, chain):
-    """Verify blocks: token-major Q [B,T,Hq,D], KV [B,Hkv,C,D], position [B] -> [B,T,Hq,D].
+def _block_attend(query, key, value, position, scale, chain, config):
+    batch, tokens, query_heads, dim = query.shape
+    kv_heads, capacity = key.shape[1:3]
+    groups = query_heads // kv_heads
+    members = tokens * groups
+    block_n, splits, warps = config
+    chunk = triton.cdiv(capacity, splits)
+    out = torch.empty((batch, tokens, query_heads, dim), device=query.device, dtype=query.dtype)
+    if splits == 1:
+        partial = stats = out  # Unused pointers in this compiled specialization.
+    else:
+        partial = torch.empty((batch * kv_heads, splits, members, dim), device=query.device, dtype=torch.float32)
+        stats = torch.empty((batch * kv_heads, splits, members, 2), device=query.device, dtype=torch.float32)
+    _block_partials[(batch * kv_heads, splits)](
+        query, key, value, position, chain, partial, stats, out,
+        TOKENS=tokens, GROUPS=groups, Q_HEADS=query_heads, KV_HEADS=kv_heads,
+        DIM=dim, CAPACITY=capacity, SPLITS=splits, CHUNK=chunk, SCALE=scale,
+        BLOCK_M=max(16, triton.next_power_of_2(members)), BLOCK_N=block_n,
+        num_warps=warps, num_stages=2,
+    )
+    if splits > 1:
+        _block_merge[(batch * tokens * query_heads,)](
+            partial, stats, out,
+            TOKENS=tokens, GROUPS=groups, Q_HEADS=query_heads, KV_HEADS=kv_heads,
+            DIM=dim, SPLITS=splits, BLOCK_S=triton.next_power_of_2(splits), num_warps=4,
+        )
+    return out
 
-    Token t of row b occupies slot ``position[b] + t``. The first ``chain[b]``
-    tokens attend causally; the rest are alternatives to token 1 and attend to
-    the prefix through token 0 plus themselves. The block's own keys must
-    already be in the cache.
+
+_BLOCK_CONFIGS = {}
+
+
+def _choose_block(query, key, value, position, scale, chain):
+    batch, tokens, heads, dim = query.shape
+    kv_heads, capacity = key.shape[1:3]
+    default = _default_config(batch, kv_heads, capacity)
+    deadline = time.monotonic() + 6.0
+    generator = torch.Generator(device=query.device).manual_seed(16180)
+    q = torch.randn(query.shape, device=query.device, dtype=query.dtype, generator=generator)
+    k = torch.randn(key.shape, device=key.device, dtype=key.dtype, generator=generator)
+    v = torch.randn(value.shape, device=value.device, dtype=value.dtype, generator=generator)
+    # Test full chains and all-alternative trees even at batch one, plus a
+    # mixed batch. Positions also differ; probes never mutate real KV state.
+    position = (position - 3 * torch.arange(batch, device=query.device)).clamp_min(0)
+    chains = torch.arange(batch, device=query.device, dtype=torch.int64) % tokens + 1
+    patterns = [torch.ones_like(chains), torch.full_like(chains, tokens), chains]
+    references = [_block_attend(q, k, v, position, scale, pattern, default) for pattern in patterns]
+    options = [default]
+    best = default
+    best_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, default))
+    candidates = [(64, 1, 4), (128, max(1, default[1] // 2), 4), (64, max(1, default[1] // 2), 4)]
+    for config in candidates:
+        if config in options or time.monotonic() >= deadline:
+            continue
+        if not all(
+            torch.allclose(_block_attend(q, k, v, position, scale, pattern, config).float(),
+                           reference.float(), atol=0.02, rtol=0.02)
+            for pattern, reference in zip(patterns, references)
+        ):
+            continue
+        options.append(config)
+        elapsed = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, config))
+        if elapsed < best_ms * 0.97:
+            best, best_ms = config, elapsed
+    if best != default:
+        native_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, default))
+        best_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, best))
+        if best_ms >= native_ms * 0.97:
+            best = default
+    print(f"block attention warmup: batch={batch} tokens={tokens} layout={best} default={default}", flush=True)
+    return best, options
+
+
+def block_attention(query, key, value, position, scale, chain):
+    """Dense tree verification: Q [B,T,Hq,D], KV [B,Hkv,C,D] -> [B,T,Hq,D].
+
+    Each row's first chain[b] slots are causal, remaining slots are alternative
+    first drafts. All choices use the same mask and every valid cached key.
     """
     batch, tokens, query_heads, dim = query.shape
     kv_heads, capacity = key.shape[1:3]
@@ -322,23 +399,13 @@ def block_attention(query, key, value, position, scale, chain):
     assert value.shape == key.shape and key.shape[3] == dim and dim in (64, 128)
     assert position.shape == (batch,) and position.dtype == torch.int64
     assert chain.shape == (batch,) and chain.dtype == torch.int64
-    groups = query_heads // kv_heads
-    members = tokens * groups
-    block_n, splits, warps = _default_config(batch, kv_heads, capacity)
-    chunk = triton.cdiv(capacity, splits)
-    partial = torch.empty((batch * kv_heads, splits, members, dim), device=query.device, dtype=torch.float32)
-    stats = torch.empty((batch * kv_heads, splits, members, 2), device=query.device, dtype=torch.float32)
-    out = torch.empty((batch, tokens, query_heads, dim), device=query.device, dtype=query.dtype)
-    _block_partials[(batch * kv_heads, splits)](
-        query, key, value, position, chain, partial, stats,
-        TOKENS=tokens, GROUPS=groups, Q_HEADS=query_heads, KV_HEADS=kv_heads,
-        DIM=dim, CAPACITY=capacity, SPLITS=splits, CHUNK=chunk, SCALE=scale,
-        BLOCK_M=max(16, triton.next_power_of_2(members)), BLOCK_N=block_n,
-        num_warps=warps, num_stages=2,
-    )
-    _block_merge[(batch * tokens * query_heads,)](
-        partial, stats, out,
-        TOKENS=tokens, GROUPS=groups, Q_HEADS=query_heads, KV_HEADS=kv_heads,
-        DIM=dim, SPLITS=splits, BLOCK_S=triton.next_power_of_2(splits), num_warps=4,
-    )
-    return out
+    shape = (query.device, batch, tokens, query_heads, kv_heads, capacity, dim)
+    if shape not in _BLOCK_CONFIGS:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("block attention selection must finish during eager warmup")
+        _BLOCK_CONFIGS[shape], options = _choose_block(query, key, value, position, scale, chain)
+        register(
+            ("block_attention", *shape[1:]), batch * tokens, 1 << 40, options,
+            lambda: _BLOCK_CONFIGS[shape], lambda config: _BLOCK_CONFIGS.__setitem__(shape, config),
+        )
+    return _block_attend(query, key, value, position, scale, chain, _BLOCK_CONFIGS[shape])

@@ -1,12 +1,13 @@
 """Emulate _block_partials/_block_merge index formulas verbatim (float64) against reference attention."""
 import math, torch
 torch.manual_seed(0)
-def emulate(query, key, value, position, scale, splits, block_n, chain):
+def emulate(query, key, value, position, scale, splits, block_n, chain, direct=False):
     B, T, Hq, D = query.shape; Hkv, C = key.shape[1:3]; G = Hq // Hkv; M = T * G
     chunk = -(-C // splits)
     qf, kf, vf = query.reshape(-1), key.reshape(-1), value.reshape(-1)
     partial = torch.zeros(B * Hkv, splits, M, D, dtype=torch.float64); stats = torch.zeros(B * Hkv, splits, M, 2, dtype=torch.float64)
     pf, sf = partial.reshape(-1), stats.reshape(-1)
+    direct_out = torch.full((B * T * Hq * D,), float("nan"), dtype=torch.float64)
     for group in range(B * Hkv):
         row, kv_head = group // Hkv, group % Hkv
         for split in range(splits):
@@ -38,6 +39,11 @@ def emulate(query, key, value, position, scale, splits, block_n, chain):
                     maximum = nxt
                 slot = (group * splits + split) * M + member
                 pf[slot * D: slot * D + D] = acc; sf[slot * 2] = maximum; sf[slot * 2 + 1] = denom
+                if direct:
+                    assert splits == 1
+                    direct_out[q_offset:q_offset + D] = acc / denom
+    if direct:
+        return direct_out.reshape(B, T, Hq, D)
     out = torch.zeros(B * T * Hq * D, dtype=torch.float64)
     for index in range(B * T * Hq):
         head = index % Hq; token = (index // Hq) % T; row = index // (Hq * T)
@@ -66,8 +72,12 @@ for B, T, Hq, Hkv, D, C, splits, block_n in ((1, 5, 8, 2, 4, 23, 3, 4), (3, 4, 8
     q = torch.randn(B, T, Hq, D, dtype=torch.float64); k = torch.randn(B, Hkv, C, D, dtype=torch.float64); v = torch.randn_like(k)
     k[:, :, :, :] += 0  # unused tail slots hold huge junk: they must never be read
     position = torch.randint(0, C - T, (B,))
+    position[0] = 0
     for b in range(B): k[b, :, int(position[b]) + T:] = 1e6; v[b, :, int(position[b]) + T:] = 1e6
     for chain in (T, max(1, T - 2), 2, 1):
         got, want = emulate(q, k, v, position, D ** -0.5, splits, block_n, chain), reference(q, k, v, position, D ** -0.5, chain)
         assert torch.allclose(got, want, atol=1e-9), (B, T, chain, float((got - want).abs().max()))
+        direct = emulate(q, k, v, position, D ** -0.5, 1, block_n, chain, direct=True)
+        assert torch.allclose(direct, want, atol=1e-9), (B, T, chain, "direct", float((direct - want).abs().max()))
 print("block attention index formulas (chain and tree masks) match the reference, incl. position 0, empty splits, junk tails")
+print("single-pass direct output layout and normalization match dense reference for every case")

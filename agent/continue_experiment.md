@@ -10,8 +10,12 @@ other agent on origin/main. Autoresearch skill is `.claude/skills/autoresearch`.
 - Our benchmark: benchmark = john-jpet/fast-transformer, connected by user.
 - Publish with `git push benchmark HEAD:main`. Never push to origin/main.
 - Baseline b0e2d76 was pushed to benchmark/main; result not yet read.
-- No Dryft token in checkout at start. User asked to create ignored `.env`.
-  Use agent/tools/dryft_api.py once present, never print its contents.
+- User supplied Dryft credentials in ignored `.env`; API access verified.
+  Use agent/tools/dryft_api.py, never print `.env` contents.
+- Baseline run 676484f5-cdc8-409e-b53b-7d0d2da4cbb4 measuring.
+- E01 416fc34 run 61381803-5628-461c-a59f-d900e98d3f81 queued.
+- Background watch_run.py processes write agent/results/watch_baseline.log
+  and watch_e01.log, plus raw final JSONs. No duplicate runs needed.
 
 ## E01 candidate
 
@@ -35,6 +39,10 @@ Use WSL rather than waiting on it. Do not put environments in /tmp: WSL
 restart removed the first setup there. CLI installed with upstream SHA check.
 
 ## Next
+
+E02 stacks single-pass dense tree attention and bounded shape selection on E01.
+No drafting changes. CPU direct/split mask tests, SM90 compilation, two reviews,
+protocol tests and archive validation passed. No H100 performance claim yet.
 
 Read baseline and E01 results, record metrics in results.tsv, keep/discard
 with new commits. Confirm no regressions in prefill, TPOT, warmup or spread.

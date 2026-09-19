@@ -10,6 +10,8 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.pdl import wait as pdl_wait
+
 
 @triton.jit
 def _propose(
@@ -26,6 +28,7 @@ def _propose(
     earns wide alternatives. ``chains`` gets 1 + D, ``phases`` each token's
     RoPE offset (the chain counts up; alternatives stand where draft 1 stands).
     """
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     base = history + row * SIZE
     place = tl.load(position + row)
@@ -126,6 +129,7 @@ def _settle(
     tokens, greedy, position, limit, history, result, move_from, move_to, chains, stale,
     SIZE: tl.constexpr, TOKENS: tl.constexpr, BLOCK: tl.constexpr,
 ):
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     slot = tl.arange(0, BLOCK).to(tl.int64)
     inside = slot < TOKENS
@@ -181,6 +185,7 @@ def _relocate(
     BATCH: tl.constexpr, KV_HEADS: tl.constexpr, CAPACITY: tl.constexpr, DIM: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
+    pdl_wait()  # before any global memory access
     plane = tl.program_id(0).to(tl.int64)  # flattened (key/value, layer)
     row = tl.program_id(1).to(tl.int64)
     source = tl.load(move_from + row)

@@ -1,7 +1,7 @@
 """Emulate kernels/spec.py (tree propose + settle) line by line; the emitted text must equal sequential greedy."""
 import random
 
-def emu_propose(h, place, top, SIZE, TOKENS, D, MAXLEN, TOP):
+def emu_propose(h, place, top, SIZE, TOKENS, D, MAXLEN, TOP, hint=-1):
     LANES = TOKENS - 1 - min(D); ALTERNATES = min(LANES, 3)
     last = h[place]; rank = []; one_mask = []
     for index in range(SIZE):
@@ -25,6 +25,7 @@ def emu_propose(h, place, top, SIZE, TOKENS, D, MAXLEN, TOP):
         if step == 1: first = draft
     if LANES > 0:
         siblings = [-1] * LANES; count = 0
+        if hint >= 0 and hint != first and TOKENS - 1 - drafts >= 2: siblings[0] = hint; count = 1
         after = [h[i + 1] if one_mask[i] else -1 for i in range(SIZE)]
         for _ in range(ALTERNATES):
             choice = max((rank[i] if (one_mask[i] and not (after[i] == first or after[i] in siblings)) else -1) for i in range(SIZE))
@@ -48,6 +49,7 @@ def emu_settle(tokens, greedy, place, limit, CHAIN):
     hit = min([slot if (slot >= CHAIN and tokens[slot] == wanted) else T for slot in range(T)])
     room = max(limit - place, 0)
     branch = gained == 1 and hit < T and room >= 2
+    emu_settle.stale = greedy[min(gained, T - 1)] if (gained < CHAIN and not branch) else -1
     gained = min(2 if branch else gained, room)
     bonus = greedy[min(hit, T - 1)]
     emitted = [bonus if (branch and slot == 1) else greedy[slot] for slot in range(T)]
@@ -75,8 +77,10 @@ for seed in range(400):
     h = [0] * SIZE; h[:prompt_len] = prompt; h[prompt_len] = nxt(prompt); place = prompt_len
     emitted_all = [h[prompt_len]]
     kv = {i: prompt[i] for i in range(prompt_len)}     # slot -> token whose K/V it holds
+    hint = -1
     while len(emitted_all) < outputs:
-        tokens, CHAIN, phases = emu_propose(h, place, top, SIZE, TOKENS, D, 8, TOP)
+        tokens, CHAIN, phases = emu_propose(h, place, top, SIZE, TOKENS, D, 8, TOP, hint)
+        if hint >= 0 and hint in tokens[CHAIN:]: stats['hints'] = stats.get('hints', 0) + 1
         stats["chains"].add((TOKENS, CHAIN))
         assert tokens[0] == h[place] and phases[:CHAIN] == list(range(CHAIN)) and all(p == 1 for p in phases[CHAIN:])
         for t in range(TOKENS): kv[place + t] = tokens[t]
@@ -85,10 +89,10 @@ for seed in range(400):
         for t in range(TOKENS):
             context = known + tokens[: t + 1] if t < CHAIN else known + [tokens[0], tokens[t]]   # tree mask
             greedy.append(nxt(context))
-        gained, emitted, move_from, move_to = emu_settle(tokens, greedy, place, limit, CHAIN)
+        gained, emitted, move_from, move_to = emu_settle(tokens, greedy, place, limit, CHAIN); hint = emu_settle.stale
         if move_from >= 0: kv[move_to] = kv[move_from]; stats["branch"] += 1
         for slot in range(TOKENS): h[place + 1 + slot] = emitted[slot]
         emitted_all += emitted[:gained]; place += gained; stats["passes"] += 1
         assert place <= limit and place + TOKENS < SIZE
     assert emitted_all == ref[prompt_len:], (seed, emitted_all[:10], ref[prompt_len:prompt_len + 10])
-print(f"tree speculation with match-length shapes equals sequential greedy in 400 cases ({stats['branch']} alternative branches in {stats['passes']} passes; {len(stats['chains'])} distinct (tokens, chain) shapes seen); cache prefix invariant held")
+print(f"tree speculation with match-length shapes equals sequential greedy in 400 cases ({stats.get('hints', 0)} stale-guess alternatives, {stats['branch']} alternative branches in {stats['passes']} passes; {len(stats['chains'])} distinct (tokens, chain) shapes seen); cache prefix invariant held")

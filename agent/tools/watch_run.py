@@ -1,7 +1,7 @@
 """Wait for the official run of a commit; save the raw result; print a summary. Never starts runs."""
 import json, os, sys, time
 from dryft_api import get
-sha = sys.argv[1]; deadline = time.time() + 3000
+sha = sys.argv[1]; deadline = time.time() + 4 * 3600
 run_id = None
 def safe(path):
     try: return get(path)

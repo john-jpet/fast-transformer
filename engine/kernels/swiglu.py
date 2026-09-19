@@ -4,13 +4,16 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.pdl import wait as pdl_wait
+
 from kernels.merged import load_merged, source
 from kernels.tune import pick
 
 
 @triton.jit
-def _swiglu(packed, output, WIDTH: tl.constexpr, BLOCK: tl.constexpr, COUNT: tl.constexpr = 1, SPLITS: tl.constexpr = 1):
+def _swiglu(packed, output, WIDTH: tl.constexpr, BLOCK: tl.constexpr, COUNT=1, SPLITS: tl.constexpr = 1):
     # One program per (row, column block): no per-element division.
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     column = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = column < WIDTH

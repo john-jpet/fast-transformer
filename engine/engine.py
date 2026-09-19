@@ -6,6 +6,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 from decode import DecodeState, optimize_model
+from kernels import pdl
 from speculate import successor_table
 
 #: Decode steps enqueued beyond the one being read. Bounded, so an abandoned
@@ -18,6 +19,9 @@ class Engine:
         """Load the pinned checkpoint from model_path. Untimed, budgeted."""
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+        # Decided before the first engine kernel exists: every Triton kernel of
+        # a pass may then launch programmatically (kernels/pdl.py).
+        pdl.self_test("cuda:0")
         self.model = (
             AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -34,6 +38,10 @@ class Engine:
         self.model.successor = successor_table(self.model)
         optimize_model(self.model)
         self.state = None
+        # torch.cuda.graph runs a full gc.collect() on entry, and warmup enters
+        # dozens of captures: freeze the model's object graph out of its reach.
+        gc.collect()
+        gc.freeze()
 
     def generate(self, input_ids: list[list[int]], max_new_tokens: int):
         """Greedy continuation of every sequence, one step at a time.

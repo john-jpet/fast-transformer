@@ -48,9 +48,15 @@ the metric is `val_bpb` after 5 minutes. Here:
    Triton interpreter does NOT work there); new index/mask/bookkeeping formulas are emulated line by
    line in plain Python against a reference (`agent/local_cpu/check_*.py`).
 4. `git add <explicit paths> && git commit && git push origin HEAD` — this IS the experiment run.
-5. Start the background watcher and IMMEDIATELY begin the next idea. Do not wait on results;
-   independent candidates may be stacked in the queue (a stacked candidate inherits its predecessors).
-6. When a result lands, append one line to `agent/results.tsv` (tab-separated):
+5. Start the background watcher and IMMEDIATELY begin the next idea; do not wait on results. But the
+   platform runs ONE submission at a time (~10 min): keep AT MOST TWO runs queued. Finished work
+   beyond that is committed locally and pushed when a slot frees up, bundled deliberately (a stacked
+   candidate inherits its predecessors). A long queue makes the submissions page unreadable for the
+   user and delays every result by an hour.
+6. Collect results without blocking: `cd agent/tools && python3 collect_runs.py` saves every finished
+   run to `agent/results/` and rebuilds `agent/results.tsv`. The platform queue is FIFO per team (about
+   10 minutes per run): keep at most ~4 runs queued and drop superseded ones with
+   `./bin/dryft cancel <run_id>`. Each row of `agent/results.tsv` (tab-separated) is:
    `commit	score	public0_tps	public1_tps	public2_tps	status	description` with status
    `keep` (new best or clear public-case win), `discard`, or `crash` (failed/canceled run; score 0).
 7. `keep` -> the branch advances. `discard` -> undo it with a NEW commit that restores the previous

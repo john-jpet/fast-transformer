@@ -8,6 +8,8 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.pdl import wait as pdl_wait
+
 from kernels.merged import load_merged, source
 from kernels.tune import pick
 
@@ -18,6 +20,7 @@ MAX_BLOCK = 8192
 
 @triton.jit
 def _rms_norm_kernel(x_ptr, w_ptr, y_ptr, row_stride, n_cols, eps, BLOCK: tl.constexpr):
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     mask = cols < n_cols
@@ -73,8 +76,9 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 def _add_rms_norm_kernel(
     x_ptr, residual_ptr, w_ptr, out_ptr, sum_ptr,
     WIDTH: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr,
-    COUNT: tl.constexpr = 1, SPLITS: tl.constexpr = 1,
+    COUNT=1, SPLITS: tl.constexpr = 1,
 ):
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     valid = cols < WIDTH

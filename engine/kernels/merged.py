@@ -35,7 +35,7 @@ def source(x):
 
 
 @triton.jit
-def load_merged(ptr, offsets, mask, COUNT: tl.constexpr, SPLITS: tl.constexpr):
+def load_merged(ptr, offsets, mask, COUNT, SPLITS: tl.constexpr):
     """BF16 values at ``offsets``: stored directly, or the rounded sum of the FP32 partials."""
     if SPLITS == 1:
         return tl.load(ptr + offsets, mask, other=0)

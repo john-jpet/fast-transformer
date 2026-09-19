@@ -5,7 +5,6 @@ from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
 
 from attention import grouped_sdpa
 from kernels.decode_attention import block_attention, decode_attention
-from kernels.gated_linear import gated_linear
 from kernels.linear import MAX_ROWS, linear
 from kernels.qk_rope import qk_rope_cache
 from kernels.swiglu import swiglu
@@ -39,15 +38,20 @@ class PackedAttention(torch.nn.Module):
         # In a verify block the consumer kernels take a split projection's
         # FP32 partials directly (kernels/merged.py): no merge launch.
         block = past_key_value is not None and not past_key_value.prefilling and hidden_states.shape[1] > 1
-        packed = linear(hidden_states, self.qkv_weight, split_ok=block)
-        cos, sin = position_embeddings
+        # One-token decode steps (batches without speculation) hand their split
+        # partials to the same consumers: 144 merge launches fewer per step.
+        split = past_key_value is not None and not past_key_value.prefilling
+        packed = linear(hidden_states, self.qkv_weight, split_ok=split)
+        # Two entries: gathered cos/sin. Three: the whole tables plus each
+        # block token's RoPE phase (verify blocks): the kernel reads them in place.
+        cos, sin, *phases = position_embeddings
         if past_key_value is not None:
             key = past_key_value.keys[self.layer_idx]
             value = past_key_value.values[self.layer_idx]
             query = qk_rope_cache(
                 packed, self.q_norm, self.k_norm, cos, sin, cache_position,
                 key, value, self.q_width // self.head_dim,
-                prefill=past_key_value.prefilling, rows=block,
+                prefill=past_key_value.prefilling, rows=block, phases=phases[0] if phases else None,
             )
             if last_token_only:
                 # The final prompt query follows every cached key, so it is
@@ -79,7 +83,7 @@ class PackedAttention(torch.nn.Module):
             attention, _ = grouped_sdpa(
                 self, query, key, value, attention_mask, scaling=self.scaling, dropout=0.0
             )
-        return linear(attention.reshape(*output_shape, -1).contiguous(), self.o_proj.weight, split_ok=block), None
+        return linear(attention.reshape(*output_shape, -1).contiguous(), self.o_proj.weight, split_ok=split), None
 
 
 class PackedMLP(torch.nn.Module):
@@ -94,8 +98,5 @@ class PackedMLP(torch.nn.Module):
 
     def forward(self, hidden_states, split_ok=False):
         rows = hidden_states.numel() // hidden_states.shape[-1]
-        if rows > MAX_ROWS and hidden_states.dtype == torch.bfloat16:
-            # Prefill: gate/up GEMM with the SwiGLU epilogue, if it measured faster.
-            return linear(gated_linear(hidden_states, self.gate_up_weight), self.down_proj.weight)
         gate_up = linear(hidden_states, self.gate_up_weight, split_ok=split_ok)
         return linear(swiglu(gate_up), self.down_proj.weight, split_ok=split_ok)

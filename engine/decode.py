@@ -9,7 +9,7 @@ import time
 
 import torch
 
-from kernels.argmax import argmax
+from kernels.argmax import argmax, greedy_tokens
 from kernels.rmsnorm import add_rms_norm, rms_norm
 from kernels.decode_attention import decode_attention
 from kernels.linear import keep_native, linear
@@ -33,10 +33,21 @@ DRAFTS_BY_MATCH = {
 #: replays of the model's greedy text (276 samples) shrunk toward 1 by the
 #: factor seen on the platform's public batch-one case (0.57 of the offline
 #: gain). Only the ratios between sizes matter. Short / long (>= 96) outputs.
+#: Expected verify passes per output token for each block size, from offline
+#: replays of the model's greedy text (276 samples) shrunk toward 1 by the
+#: factor seen on the platform's public batch-one case (0.57 of the offline
+#: gain). Only the ratios between sizes matter. Short / long (>= 96) outputs.
+#: (A per-batch-class refit on E[max over rows] - candidate 79 - scored 1.5%
+#: lower on the hidden shapes with the public ones unchanged: reverted.)
 EXPECTED_PASSES = {
     2: (0.897, 0.854), 3: (0.869, 0.814), 4: (0.846, 0.794), 5: (0.832, 0.777),
     8: (0.805, 0.749), 16: (0.779, 0.718),
 }
+
+
+def expected_passes(size, batch, long_output):
+    """Verify passes per output token for this block size."""
+    return EXPECTED_PASSES[size][long_output]
 
 
 def block_candidates(batch):
@@ -73,6 +84,61 @@ PACE_FLOOR = 0.70
 PACE_FLOOR_LONG = 0.60
 LONG_OUTPUT = 96
 PACE_MEDIAN = 0.88
+#: The gate compares whole samples, prefill included: fastest = ttft + F x D,
+#: slowest plausible = ttft + WORST_PASSES x D (D = pass time x steps), and
+#: slowest <= 1.25 x fastest gives F >= (WORST_PASSES x D - 0.25 x ttft) / (1.25 x D).
+#: With a 512-token prompt that is 0.70 again; a long prompt earns a lower
+#: floor (offline: 0.66 at 2048 tokens, batch one). Never above PACE_FLOOR.
+WORST_PASSES = 0.90
+PACE_FLOOR_MIN = 0.60
+
+
+class Mailbox:
+    """Completion stamps the GPU writes into pinned host memory, read without a driver call.
+
+    The sandboxed host traps every event query or wait; the host loop makes
+    one or two per pass and its release loop spins on them. Instead each pass
+    (or step) copies its result and then its stamp, in stream order, and the
+    host polls the stamp with a plain memory read. The event stays recorded:
+    a stamp that has not shown up within a generous window means the
+    mechanism is not trustworthy on this system, and events take over for
+    good.
+    """
+
+    SPAN = 1 << 20
+
+    def __init__(self, slots, device):
+        try:
+            self.flags = torch.zeros(slots, dtype=torch.int64, pin_memory=True)
+            self.usable = True
+        except RuntimeError:
+            self.flags = torch.zeros(slots, dtype=torch.int64)
+            self.usable = False
+        self.stamps = torch.arange(1, slots + 1, dtype=torch.int64, device=device)
+        self.base = 0
+
+    def next_generation(self):
+        """On the stream, after whatever the previous generation left there."""
+        self.stamps.add_(self.SPAN)
+        self.base += self.SPAN
+
+    def post(self, slot):
+        """Enqueue right after the slot's payload copy on the same stream."""
+        if self.usable:
+            self.flags[slot:slot + 1].copy_(self.stamps[slot:slot + 1], non_blocking=True)
+
+    def ready(self, slot):
+        return self.usable and int(self.flags[slot]) == self.base + slot + 1
+
+    def wait(self, slot, event, window=0.5):
+        if self.usable:
+            deadline = time.perf_counter() + window
+            while time.perf_counter() < deadline:
+                if self.ready(slot):
+                    return
+            self.usable = False  # the stamp never came: events from now on
+            print("mailbox: falling back to events", flush=True)
+        event.synchronize()
 
 
 class FusedRMSNorm(torch.nn.Module):
@@ -173,13 +239,18 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None, e
             attention, residual, layer.post_attention_layernorm.weight,
             layer.post_attention_layernorm.variance_epsilon,
         )
-        hidden = layer.mlp(normalized, split_ok=every)
+        hidden = layer.mlp(normalized, split_ok=not cache.prefilling)
     if every:
         normalized, _ = add_rms_norm(hidden, residual, base.norm.weight, base.norm.variance_epsilon)
-        return linear(normalized, model.lm_head.weight)
+        # The verify pass wants greedy tokens, not logits: the fused kernel
+        # never writes the [rows, vocabulary] tensor (kernels/argmax.py).
+        return greedy_tokens(normalized, model.lm_head.weight, linear)
     # RMSNorm acts independently on each token; earlier final states are unused.
+    if token_ids.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+    # (A one-token decode step may hand over split partials: nothing to slice.)
     normalized, _ = add_rms_norm(
-        hidden[:, -1:, :], residual[:, -1:, :],
+        hidden, residual[:, -1:, :],
         base.norm.weight, base.norm.variance_epsilon,
     )
     return linear(normalized, model.lm_head.weight)[:, 0, :]
@@ -231,7 +302,12 @@ class DecodeState:
                     # tail): the budget belongs to the verify-block shapes.
                     keep_native(batch, projection)
                 else:
-                    linear(projection.new_zeros((batch, 1, projection.shape[1])), projection)
+                    # Timed the way the decode step uses them: layer projections
+                    # feed split-aware consumers, the vocabulary projection does not.
+                    linear(
+                        projection.new_zeros((batch, 1, projection.shape[1])), projection,
+                        split_ok=projection is not model.lm_head.weight,
+                    )
         # Likewise the launch widths of the small per-layer decode kernels.
         layer = model.model.layers[0]
         hidden = weight.new_zeros((batch, 1, weight.shape[1]))
@@ -266,13 +342,14 @@ class DecodeState:
         except RuntimeError:
             self.host_tokens = torch.empty((output_length, batch), dtype=torch.int64)
         self.events = [torch.cuda.Event() for _ in range(output_length)]
+        self.mailbox = Mailbox(output_length, self.device)
         self.enqueued = 0
         self.graph = None
         self.prefill_graph = None
+        self.prefill_seconds = 0.0
         self.capture_prefill()
         if self.speculative:
             self.choose_block(model, weight)
-            self.refine()
         elif output_length > 1:
             self.capture()
 
@@ -299,6 +376,7 @@ class DecodeState:
             self.stale = torch.full((batch,), -1, dtype=torch.int64, device=self.device)
             self.cache.chain = self.chains
             self.pass_events = [torch.cuda.Event() for _ in range(output_length)]
+            self.pass_mailbox = Mailbox(output_length, self.device)
         # Per block size: each block token's RoPE offset (the chain counts up,
         # alternatives stand where draft 1 stands; KV slots are position + t),
         # the pass result and its pinned host mirror.
@@ -313,12 +391,19 @@ class DecodeState:
         # Unpaced seconds per token of earlier generations in this process.
         self.natural, self.finished, self.generations = [], None, 0
         layer = model.model.layers[0]
+        # Tuning budget in order of weight traffic per pass: the vocabulary
+        # projection runs once, the others once per layer.
         for projection in (
             layer.mlp.gate_up_weight, layer.mlp.down_proj.weight,
-            model.lm_head.weight, layer.self_attn.qkv_weight,
-            layer.self_attn.o_proj.weight,
+            layer.self_attn.qkv_weight, layer.self_attn.o_proj.weight,
+            model.lm_head.weight,
         ):
-            linear(projection.new_zeros((batch, tokens, projection.shape[1])), projection)
+            # Layer projections feed split-aware consumers in a verify block;
+            # the vocabulary projection feeds argmax and needs a merged tensor.
+            linear(
+                projection.new_zeros((batch, tokens, projection.shape[1])), projection,
+                split_ok=projection is not model.lm_head.weight,
+            )
         hidden = weight.new_zeros((batch, tokens, weight.shape[1]))
         add_rms_norm(hidden, hidden, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
         swiglu(weight.new_zeros((batch, tokens, layer.mlp.gate_up_weight.shape[0])))
@@ -329,12 +414,13 @@ class DecodeState:
             self.history, self.row_position, self.block_size, self.drafts_by_match,
             self.model.successor, self.stale, self.chains, self.phases,
         )
-        positions = self.row_position[:, None] + self.phases
-        rope = (self.cos[0][positions], self.sin[0][positions])
+        # Whole tables; the QK-RoPE kernel reads row b's token t at
+        # row_position[b] + phases[b, t] (three host launches fewer per pass).
+        rope = (self.cos[0], self.sin[0], self.phases)
         logits = forward_last(
             self.model, tokens, self.cache, self.row_position, rope, every=True
         )
-        greedy = argmax(logits)
+        greedy = logits  # forward_last(every=True) already reduced them
         # Keep what the model itself chose (chain drafts, or one alternative),
         # never past the last requested token; record it; move each row.
         spec.settle(
@@ -344,12 +430,12 @@ class DecodeState:
         if min(self.drafts_by_match) < self.block_size - 1:
             spec.relocate(self.cache.store, self.move_from, self.move_to)
 
-    def capture_speculation(self):
+    def capture_speculation(self, eager=3):
         current = torch.cuda.current_stream(self.device)
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(current)
         with torch.cuda.stream(stream):
-            for _ in range(3):
+            for _ in range(eager):
                 self.row_position.fill_(self.shape[1])
                 self.speculate()
         current.wait_stream(stream)
@@ -359,21 +445,37 @@ class DecodeState:
         with torch.cuda.graph(self.spec_graph, stream=stream):
             self.speculate()
         current.wait_stream(stream)
-        # The pass time sets the release pace that bounds sample-to-sample spread.
+        # The pass time sets the release pace that bounds sample-to-sample
+        # spread. Passes run back to back in a generation, so they are timed
+        # back to back: four per reading, without the launch and wake-up
+        # latency that a synchronize after every replay adds to each one.
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         times = []
-        for _ in range(12):
+        for _ in range(3):
             self.row_position.fill_(self.shape[1])
+            torch.cuda.synchronize(self.device)
             start.record()
-            self.spec_graph.replay()
+            for _ in range(4):
+                self.spec_graph.replay()
             end.record()
             end.synchronize()
-            times.append(start.elapsed_time(end))
+            times.append(start.elapsed_time(end) / 4)
         self.row_position.fill_(self.shape[1])
         self.history.zero_()
         self.stale.fill_(-1)
         self.pass_seconds = sorted(times)[len(times) // 2] / 1000.0
-        self.pace_seconds = (PACE_FLOOR_LONG if self.shape[2] >= LONG_OUTPUT else PACE_FLOOR) * self.pass_seconds
+        self.pace_seconds = self.pace_floor() * self.pass_seconds
+
+    def pace_floor(self):
+        """Fastest allowed release, as a fraction of the pass time (shape-only, fixed at warmup)."""
+        outputs = self.shape[2]
+        if outputs >= LONG_OUTPUT:
+            return PACE_FLOOR_LONG
+        decode = (outputs - 1) * self.pass_seconds
+        if decode <= 0.0:
+            return PACE_FLOOR
+        floor = (WORST_PASSES * decode - 0.25 * self.prefill_seconds) / (1.25 * decode)
+        return min(PACE_FLOOR, max(PACE_FLOOR_MIN, floor))
 
     def choose_block(self, model, weight):
         """Measure each candidate block size on this workload's real shape; keep the best.
@@ -382,8 +484,15 @@ class DecodeState:
         much more depends on the batch and the context length (attention work
         scales with the block). Score = measured pass time x expected passes
         per token. Shape-only: decided once at warmup, before any sample.
+        Each size is compared AFTER its graph was refined, on a share of the
+        refinement budget: an untuned layout must not eliminate the faster
+        size (idea from the Silver Bullet fork, with their consent). The
+        refined layouts are keyed by row count, so the winner keeps them.
         """
         long_output = self.shape[2] >= LONG_OUTPUT
+        # The whole run has room again (612 s of 900 with candidate 67): spend it
+        # where layouts are judged inside the real graph.
+        seconds = 16.0 / len(self.candidates)  # every refine call may overrun by one option
         best = None
         for size in (*self.candidates, None):
             if size is None:
@@ -394,7 +503,9 @@ class DecodeState:
                 self.block_size, self.drafts_by_match = size, DRAFTS_BY_MATCH[size]
                 self.prepare_speculation(model, weight)
             self.capture_speculation()
-            cost = self.pass_seconds * EXPECTED_PASSES[size][long_output]
+            if best is None or size != best[1]:
+                self.refine(seconds)
+            cost = self.pass_seconds * expected_passes(size, self.shape[0], long_output)
             if best is None or cost < best[0]:
                 best = (cost, size)
 
@@ -408,26 +519,33 @@ class DecodeState:
         """
         deadline = time.monotonic() + seconds
         best = self.pass_seconds
-        for knob in knobs(self.shape[0] * self.block_size):
+        ordered = knobs(self.shape[0] * self.block_size)
+        captured = [knob.get() for knob in ordered]
+        for knob in ordered:
             chosen = knob.get()
             for option in knob.options:
                 if option == chosen or time.monotonic() >= deadline:
                     continue
                 knob.select(option)
-                self.capture_speculation()
+                # Libraries and streams are warm by now: one eager pass is
+                # enough to compile what this option newly needs.
+                self.capture_speculation(eager=1)
+                captured = [other.get() for other in ordered]
                 if self.pass_seconds < best * 0.99:
                     best, chosen = self.pass_seconds, option
             knob.select(chosen)
-        self.capture_speculation()
+        if captured != [knob.get() for knob in ordered]:
+            # The graph in hand measured a rejected option: rebuild the winner's.
+            self.capture_speculation(eager=1)
 
     def absorb(self, wait):
         """Bank finished passes; with ``wait``, block for the oldest one first."""
         while self.passes_read < self.passes_enqueued:
             event = self.pass_events[self.passes_read]
             if wait:
-                event.synchronize()
+                self.pass_mailbox.wait(self.passes_read, event)
                 wait = False
-            elif not event.query():
+            elif not (self.pass_mailbox.ready(self.passes_read) or (not self.pass_mailbox.usable and event.query())):
                 return
             rows = self.host_passes[self.passes_read].tolist()
             self.passes_read += 1
@@ -447,12 +565,13 @@ class DecodeState:
                 return
             self.spec_graph.replay()
             self.host_passes[self.passes_enqueued].copy_(self.result, non_blocking=True)
+            self.pass_mailbox.post(self.passes_enqueued)
             self.pass_events[self.passes_enqueued].record()
             self.passes_enqueued += 1
 
     def read_speculative(self, step):
         if step == 0:
-            self.events[0].synchronize()
+            self.mailbox.wait(0, self.events[0])
             self.tokens = [[token] for token in self.host_tokens[0].tolist()]
             self.fill()
             self.started = time.perf_counter()
@@ -540,12 +659,24 @@ class DecodeState:
             with torch.cuda.graph(self.prefill_graph, stream=stream):
                 self.prefill_forward()
             current.wait_stream(stream)
+            # Prefill time of this shape: the pacing floor accounts for it.
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            times = []
+            for _ in range(3):
+                torch.cuda.synchronize(self.device)
+                start.record()
+                self.prefill_graph.replay()
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end))
+            self.prefill_seconds = sorted(times)[1] / 1000.0
         finally:
             self.cache.prefilling = False
 
     def snapshot(self):
         step = self.enqueued
         self.host_tokens[step].copy_(self.token_ids[:, 0], non_blocking=True)
+        self.mailbox.post(step)
         self.events[step].record()
         self.enqueued = step + 1
 
@@ -562,13 +693,16 @@ class DecodeState:
     def read(self, step):
         if self.speculative:
             return self.read_speculative(step)
-        self.events[step].synchronize()
+        self.mailbox.wait(step, self.events[step])
         return self.host_tokens[step].tolist()
 
     def prefill(self, prompt):
         # Steps left in flight by an abandoned generator precede this prefill
         # on the stream; it then overwrites every input they touched.
         self.enqueued = 0
+        self.mailbox.next_generation()
+        if self.speculative:
+            self.pass_mailbox.next_generation()
         if self.speculative:
             # Passes left by an abandoned generator precede this prefill on the
             # stream; it rewrites the position and the history they used.
@@ -578,7 +712,7 @@ class DecodeState:
                 self.natural.append((self.finished - self.started) / (self.shape[2] - 1))
             self.generations += 1
             self.tokens, self.passes_enqueued, self.passes_read, self.finished = [], 0, 0, None
-            self.pace_seconds = (PACE_FLOOR_LONG if self.shape[2] >= LONG_OUTPUT else PACE_FLOOR) * self.pass_seconds
+            self.pace_seconds = self.pace_floor() * self.pass_seconds
             if self.natural:
                 ranked = sorted(self.natural)
                 # Lower median: one slow early generation must not hold the rest back.

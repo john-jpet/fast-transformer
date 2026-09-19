@@ -71,9 +71,14 @@ def load_engine():
     decode.optimize_model = lambda model: None
     speculate = ModuleType("speculate")
     speculate.successor_table = lambda model: None
+    kernels = ModuleType("kernels")
+    pdl = ModuleType("kernels.pdl")
+    pdl.self_test = lambda device: False
+    kernels.pdl = pdl
     spec = importlib.util.spec_from_file_location("candidate_engine", ROOT / "engine/engine.py")
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {"torch": torch, "transformers": transformers, "decode": decode, "speculate": speculate}):
+    with patch.dict(sys.modules, {"torch": torch, "transformers": transformers, "decode": decode, "speculate": speculate,
+                                  "kernels": kernels, "kernels.pdl": pdl}):
         spec.loader.exec_module(module)
     return module.Engine
 

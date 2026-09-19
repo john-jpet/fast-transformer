@@ -4,6 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.pdl import wait as pdl_wait
+
 from kernels.merged import load_merged, source
 from kernels.tune import pick
 
@@ -14,8 +16,10 @@ def _qk_rope_cache(
     Q_HEADS: tl.constexpr, KV_HEADS: tl.constexpr, DIM: tl.constexpr,
     CAPACITY: tl.constexpr, Q_EPS: tl.constexpr, K_EPS: tl.constexpr,
     TOKENS: tl.constexpr, PREFILL: tl.constexpr, BLOCK: tl.constexpr,
-    ROWS: tl.constexpr = False, COUNT: tl.constexpr = 1, SPLITS: tl.constexpr = 1,
+    ROWS: tl.constexpr = False, COUNT=1, SPLITS: tl.constexpr = 1,
+    phases=None, TABLE: tl.constexpr = False,
 ):
+    pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     batch = row // TOKENS
     token = row % TOKENS
@@ -48,6 +52,11 @@ def _qk_rope_cache(
     phase = token
     if ROWS:
         phase = row
+    if TABLE:
+        # The whole cos/sin table: row b's block token t rotates at
+        # position[b] + phases[b, t] (the chain counts up, alternatives stand
+        # where draft 1 stands), read here instead of gathered by the host.
+        phase = tl.load(position + batch).to(tl.int64) + tl.load(phases + row).to(tl.int64)
     cosine = tl.load(cos + phase * DIM + col, valid, other=0).to(tl.float32)
     sine = tl.load(sin + phase * DIM + col, valid, other=0).to(tl.float32)
     # Native RoPE rounds BOTH products before their BF16 addition. Keeping
@@ -75,7 +84,7 @@ def _qk_rope_cache(
         tl.store(values + cache_offset, value, valid)
 
 
-def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_heads, prefill=False, rows=False):
+def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_heads, prefill=False, rows=False, phases=None):
     """BF16 packed QKV and [B,Hkv,C,D] caches, for prefill or one decode token.
 
     Native BF16 phases [1,T,D] are shared by batch rows. Prefill writes [0,T);
@@ -92,7 +101,13 @@ def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_he
     assert 0 < tokens <= capacity
     assert values.shape == keys.shape and dim % 2 == 0
     assert not (rows and prefill)
-    assert cos.numel() == sin.numel() == (batch if rows else 1) * tokens * dim
+    table = phases is not None
+    if table:
+        # cos/sin are the full [capacity, dim] tables; positions come from the kernel.
+        assert rows and phases.shape == (batch, tokens) and phases.is_contiguous() and phases.dtype == torch.int64
+        assert cos.shape == sin.shape and cos.shape[-1] == dim and cos.numel() // dim >= capacity
+    else:
+        assert cos.numel() == sin.numel() == (batch if rows else 1) * tokens * dim
     assert cos.is_contiguous() and sin.is_contiguous()
     assert position.shape == ((tokens,) if prefill else (batch,) if rows else (1,))
     assert position.dtype == torch.int64
@@ -105,7 +120,7 @@ def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_he
             Q_HEADS=q_heads, KV_HEADS=kv_heads, DIM=dim, CAPACITY=capacity,
             Q_EPS=q_norm.variance_epsilon, K_EPS=k_norm.variance_epsilon,
             TOKENS=tokens, PREFILL=prefill, BLOCK=triton.next_power_of_2(dim), ROWS=rows,
-            COUNT=count, SPLITS=splits,
+            COUNT=count, SPLITS=splits, phases=phases if table else position, TABLE=table,
             num_warps=warps,
         )
 

@@ -10,6 +10,7 @@ Rows are independent. Everything is fixed-shape tensor code, safe in a CUDA grap
 """
 
 import torch
+from transformers import DynamicCache
 
 
 def propose(history, position, count, index, successor):
@@ -85,10 +86,19 @@ def successor_table(model, chunk=2048, top=8, prefix=198):
     device = model.get_input_embeddings().weight.device
     table = torch.empty((vocabulary, top), dtype=torch.int64, device=device)
     with torch.inference_mode():
+        # The newline's keys and values are the same for every token: compute
+        # them once and let each chunk attend to them, instead of forwarding
+        # the newline 151936 times.
+        newline = model(input_ids=torch.tensor([[prefix]], device=device), use_cache=True).past_key_values
         for begin in range(0, vocabulary, chunk):
             ids = torch.arange(begin, min(begin + chunk, vocabulary), device=device)[:, None]
             bare = model(input_ids=ids, use_cache=False).logits[:, -1, :].float().log_softmax(-1)
-            after = torch.cat((torch.full_like(ids, prefix), ids), dim=1)
-            bare += model(input_ids=after, use_cache=False).logits[:, -1, :].float().log_softmax(-1)
+            shared = DynamicCache()
+            for layer in range(len(newline.key_cache)):
+                shared.update(
+                    newline.key_cache[layer].expand(ids.shape[0], -1, -1, -1),
+                    newline.value_cache[layer].expand(ids.shape[0], -1, -1, -1), layer,
+                )
+            bare += model(input_ids=ids, past_key_values=shared, use_cache=True).logits[:, -1, :].float().log_softmax(-1)
             table[begin:begin + ids.shape[0]] = bare.topk(top, dim=-1).indices
     return table.contiguous()

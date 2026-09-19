@@ -1,206 +1,40 @@
-# Research assignment: exact BF16 Qwen3 inference on H100
+# Research prompt: make an exact Qwen3-4B inference engine faster on one H100
 
-You are an independent inference-performance researcher working alongside an
-agent that is actively implementing and benchmarking an engine. Your task is
-to identify the next highest-value optimizations, challenge the implementation's
-assumptions, and propose concrete experiments. Research deeply using primary
-sources, pinned source code, and GPU architecture documentation. Do not merely
-list generic inference techniques.
+You are a senior GPU-inference researcher. Do deep, sourced research (papers on arXiv 2023-2026, source code and PRs of vLLM / SGLang / TensorRT-LLM / FlashInfer / gpt-fast / llama.cpp / Triton / PyTorch, NVIDIA docs and forum threads, benchmark write-ups) and tell me what would make the system below faster. Read primary sources, not abstracts. Cite every number with a URL and the table/figure it came from. Mark anything you inferred yourself as an estimate. I want ideas I have NOT already tried (see "Already built" and "Dead ends"), each with arithmetic for MY shapes.
 
-## Objective and benchmark
+## The task
 
-We are competing in the Dryft Kernel Rush challenge. Run the fixed
-`Qwen/Qwen3-4B-Instruct-2507` checkpoint, revision
-`cdbee75f17c01a7cc42f958dc650907174af0554`, on **one NVIDIA H100 80GB HBM3**.
-Maximize the geometric mean of output tokens/second across **six hidden
-workloads**. Throughput includes prefill. Three additional public workloads
-provide diagnostic measurements:
+A benchmark scores an inference engine for **Qwen3-4B-Instruct-2507** (dense; 36 layers, hidden 2560, GQA 32 query / 8 KV heads x head_dim 128, SwiGLU MLP 9728, vocab 151936, tied embeddings, BF16 weights = 8.0 GB) on **one H100 80GB**. The score is the geometric mean of tokens/s over several hidden workloads. Each workload is a fixed (batch, prompt length, output length), all rows the same length, greedy decoding, exactly `max_new_tokens` steps, one Python list of token ids yielded per step. Known example shapes: 1 x 512 -> 32, 4 x 2048 -> 32, 16 x 512 -> 128. Hidden shapes are different and unknown ("we want it to work well across the board"); do not try to guess them. Each workload runs in a fresh process: load, one warmup generation of the same shape (untimed; load + warmup <= 300 s), then five timed samples; the median sample counts.
 
-| Case | Batch | Prompt per sequence | Output per sequence |
-| --- | ---: | ---: | ---: |
-| public-0 | 1 | 512 | 32 |
-| public-1 | 4 | 2048 | 32 |
-| public-2 | 16 | 512 | 128 |
+**Hard rules**
+- Outputs must be the model's own greedy tokens: a judge replays my sequence teacher-forced through native Hugging Face and every token must be the argmax or within **2.0 logits** of it. In practice: NO quantization, NO approximate/sparse attention, NO KV eviction, NO vocabulary pruning, NO unverified draft models. Reordering floating-point sums is fine; changing where a value is rounded to BF16 is not. **Exact (lossless) speculative decoding is allowed.**
+- Software: **PyTorch 2.5.1 + Triton 3.1 + Transformers 4.51.3 only.** No vLLM/SGLang/flash-attn/FlashInfer/xformers, no custom CUDA/C++ (Triton kernels and PyTorch ops only), no network, no pip at runtime. The submission is source code only (tens of KB): no extra weights, no trained draft heads, no datastores. Anything computable from the model itself at load time is allowed if it is cheap (see time budget).
+- Gates per workload: TTFT and TPOT each <= 1.10x native HF (I am ~6x faster, irrelevant); **spread across the five samples <= 25%**; peak memory <= 90%; and the WHOLE run (all workloads: load + warmup + samples + judge) must finish in **900 s** — I am at ~800 s, so every second of warmup costs about six (one per workload). No state may carry from one generation to the next (no cross-request caches).
 
-There are five measured samples per workload. Each workload uses a fresh engine
-process: load, one untimed warmup generation of the same shape, then samples.
-Warmup can compile kernels, select implementations, allocate buffers, and
-capture CUDA graphs. Reuse weights and shape-specific state, but never prompt
-content across samples. Prompts are fresh and unknown. Do not infer hidden
-shapes or exploit the benchmark harness.
+## Current architecture (what is already built)
 
-Every case must pass:
+**Prefill**: CUDA-graphed; packed QKV and gate/up projections; fused Triton kernel for per-head Q/K RMSNorm + RoPE + KV-cache write; PyTorch SDPA FLASH backend with native GQA (a cuDNN-SDPA option with a self-check is being tested); fused add+RMSNorm; a Triton paired gate/up GEMM with SwiGLU epilogue chosen at warmup against cuBLAS; last layer and lm_head computed for the last token only. Measured TTFT: 1x512 = 10.5 ms (~37% MFU), 4x2048 = 118 ms (~55% MFU), 16x512 = 107 ms.
 
-- Each emitted token must be native Qwen's greedy argmax on OUR emitted prefix,
-  or at most **2.0 logits** below that argmax. The judge replays the whole output
-  teacher-forced after our process exits. One bad position fails the workload.
-- TTFT and TPOT must each be <= **1.10 times native**.
-- Timing spread across five samples must be <= **25%**.
-- Peak GPU memory <= **90%** of the device.
-- Load plus warmup <= **300 seconds**; each sample <= **300 seconds**.
-- Yield exactly the requested number of steps: one host list of token IDs per
-  step, one per sequence in original batch order. EOS is an ordinary token.
+**Decode = exact self-speculative decoding, no draft model.** One CUDA-graphed "verify pass" processes B rows x T block tokens (B*T = 16 or 32 rows through my Triton skinny-GEMM kernels, or 64 rows through cuBLAS; T in 2..16 chosen per shape by timing at warmup). Per row the block is `[trusted token, D chain drafts, (T-1-D) sibling alternatives for draft 1]`:
+- Drafts come from the row's own prompt+output history: GPU kernel finds earlier occurrences of the newest token, ranks by matched-suffix length (up to 8), tie -> most recent, copies the continuation as the chain; chain depth D depends on match length (e.g. T=16: 5/8/13/14 for match 0-1/2-3/4-7/8+).
+- When nothing matches, the chain is a greedy walk through a static **successor table** (top-8 next tokens per token) derived from the model itself at load (two fixed contexts, ~6 s).
+- Siblings = next tokens after other occurrences of the newest token, then table entries; NEW: the previous pass's own prediction right after its first wrong draft is tried as the first sibling (lab: 2-3% fewer passes).
+- Tree attention mask (chain is causal; each sibling sees prefix + itself), per-row positions, acceptance ("settle") and KV-slot relocation for an accepted sibling are fused Triton kernels inside the graph; the host enqueues passes 2 ahead and streams tokens through pinned memory + CUDA events.
+- **Release pacing**: because acceptance depends on the text, natural speed varies between the five samples and would break the 25% spread gate, so tokens are released no faster than 0.70 x pass time per token (0.60 for outputs >= 96). Simulation says this costs ~1.3% at batch 1 on realistic text and 0% at batch >= 4.
+- Kernels: Triton skinny GEMM (tiles of 64 output rows x chunks of K, `tl.dot` on BF16 operands with FP32 accumulation, single rounding to BF16; K split across up to 8 programs whose FP32 partials are summed inside the consumer kernel, so no merge launch); fused add+RMSNorm, SwiGLU, QK-norm+RoPE+KV-write; dense split-KV decode/verify attention with BF16 dots and FP32 softmax statistics, single-pass when one split suffices; two-stage Triton argmax over the vocabulary; layouts chosen at warmup by timing inside the real captured graph.
 
-Only official runs remain. They run on the remote platform; we do not have a
-local CUDA GPU. Do not claim a kernel is faster or numerically validated from
-source inspection alone. Published run output does not reveal hidden shapes.
+**Measured on the H100**: a verify pass of 16 rows takes ~4.3 ms (= 8.0 GB weights at ~1.87 TB/s effective; ~335-370 kernel launches per pass, ~10 per layer; layer GEMMs ~3.05 ms, lm_head ~0.32 ms, small kernels ~0.5 ms, attention ~0.35 ms at 512 context); ~5.2 ms at B=4 x 2048 context; ~5.2-6.3 ms at B=16. Acceptance on the benchmark's text: ~1.33 tokens per pass at batch 1 (easy lab text: 1.6-1.9). Public results: 306 tok/s (1x512->32), 536 tok/s (4x2048->32, where prefill is 48% of the time), 3240 tok/s (16x512->128). Native HF is ~6x slower.
 
-## Runtime and numerical constraints
+## Dead ends (measured; do NOT re-propose unless you have a specific reason mine failed)
+- n-gram frequency voting among matches; Token Recycling within one generation (adjacency of past top-k; tables cannot persist across generations here); second-level tree alternatives and general draft trees (lab: <= 1.4% at T=16, negative at T=4 — a child under a sibling is right only 17-35% of the time); a learned linear ranker over 16 candidates (lab +2%, lost on GPU to kernel cost); drafts appended during prefill; stale-logit draft CHAINS (no re-sync after a wrong token); lag-based allocation of block slots to slow rows; TETRIS-style cross-row allocation (my generation ends with its slowest row, not total tokens).
+- Layer-skip / early-exit / Jacobi-lookahead / KV-window self-drafting: by my arithmetic a draft token costing k/36 of a pass loses to free n-gram drafts. Challenge this only with numbers for a 4B model at batch 1-16.
+- Kernel side: wider GEMM tile/num_warps autotune, lossless 12-bit weight packing, int64 word loads, preferring cuBLASLt, maxnreg/num_stages tuning, a paired gate/up+SwiGLU kernel for verify blocks, in-graph re-tuning of plain decode, trigram successor table at load (17-32 s x 6 workloads against the 900 s cap), lowering the pacing floor.
 
-Pinned runtime: Python 3.11, CUDA 12.4, PyTorch **2.5.1**, Triton **3.1.0**,
-Transformers **4.51.3**, safetensors 0.5.3, tokenizers 0.21.1.
+## What I want from you
+1. **More tokens per verify pass with zero or near-zero GPU cost**, for chat/instruction text where ~75% of passes have no n-gram match longer than one token and draft 1 is right only ~20% of the time. Anything that uses signals the verify pass already computes (hidden states, attention patterns / induction heads pointing at the copy source as in PLD+, logits at accepted and rejected slots as in LogitSpec/RACER), better model-derived static tables computable in < 10 s on an H100 (logit lens, embedding/unembedding products, first-layer statistics, multi-context averaging), better use of 10-15 spare block slots at batch 1, smarter chain-depth choice. Give the acceptance numbers the source papers report on MT-Bench/Spec-Bench-like chat text at temperature 0 for 3-8B models and say which would transfer.
+2. **A cheaper verify pass** at 16-64 rows on H100 in BF16 with Triton/cuBLAS only: what effective memory bandwidth do the best small-batch kernels reach for ~2.5K-wide layers (not 4K-8K), and how; kernel-launch reduction inside CUDA graphs; multi-step graphs; GEMV/skinny-GEMM formulations in Triton 3.1 that beat `tl.dot` tiling; cuBLAS/cuBLASLt workspace or algorithm controls reachable from PyTorch 2.5.1; tree-attention kernels for T <= 16 new tokens over a 512-2200 token dense prefix (split heuristics, mask-free prefix loops, tile sizes for H100).
+3. **Faster prefill** for 1-64 rows x 512-2048 tokens with PyTorch 2.5.1 built-ins + Triton: cuDNN SDPA vs FLASH on H100 with GQA 32/8 x 128 (support, bugs, numerics in 2.5.1), why 1x512 might sit at 37% MFU and how to fix it, anything exact that beats cuBLAS GEMM for 512-8192 x 2560 <-> 9728 BF16.
+4. **Spread-gate-safe speed**: ideas that raise the SLOWEST sample's speed (hard text) rather than the average, since the pacing floor is set by the worst plausible sample.
+5. Anything else exact that I have missed, including host-side/CUDA-graph overheads for 100 ms generations.
 
-The submission is Python/Triton source only, under 2 MiB compressed and 200 files.
-No network, installs, compiled binaries, additional weights, external services,
-or downloads inside the engine. The checkpoint is provided at `model_path`.
-FlashAttention/FlashInfer/vLLM/SGLang implementations may be research references,
-but do not assume their packages or newer APIs exist in this runtime. Explain
-what can actually be ported as small Python/Triton source modules.
-
-No quantization, reduced-precision weights or KV cache, cache eviction, sparse or
-approximate attention, pruned vocabulary, unverified draft tokens, or changed
-model. Exact speculation is legal but must reproduce native verification.
-BF16 reordering noise is tolerated; the margin is not permission to approximate.
-Native cached decode itself can differ by roughly 0.75 logits from full replay.
-
-**Cast boundaries matter.** Native RMSNorm reduces and normalizes in FP32,
-casts the normalized activation to BF16, then multiplies by its BF16 weight.
-Native SwiGLU rounds `silu(gate)` to BF16 before multiplying it by `up` and
-rounding again. RoPE multiplies and addition also have native tensor rounding
-boundaries. A fused FP32 reformulation that rounds only once is not equivalent.
-Preserve projection outputs, residual rounding, head ordering, and lowest-index
-argmax tie behavior.
-
-## Model architecture
-
-- 36 decoder layers; hidden width **2560**; MLP width **9728**.
-- **32 Q heads**, **8 KV heads**, **128 dimensions/head**; four Q heads per KV head.
-- Q width is **4096**, not 2560. K and V are each **1024** wide.
-- No linear biases; SwiGLU MLP; dense causal attention, no sliding window.
-- Q and K receive per-head RMSNorm before RoPE. V does not.
-- RMSNorm epsilon `1e-6`; RoPE theta `5_000_000` and absolute positions.
-- Vocabulary **151936**; BF16 input embedding and LM-head weights are tied.
-- BF16 KV payload: `147456 * batch * sequence_length` bytes across all layers.
-- Layer order: input norm -> QKV -> Q/K head norm -> RoPE -> attention -> output
-  projection -> residual -> post-attention norm -> gate/up -> SiLU/product ->
-  down projection -> residual.
-
-## Repository and current implementation
-
-Repository: `https://github.com/ShreyShingala/fasty-autoreg-transformer`
-Local folder, if you share the workspace:
-`/Users/shrey/Downloads/Coding/fasty-autoreg-transformer`
-
-Read `QWEN_ENGINE_CONTRACT.md` and `OPTIMIZATION_GUIDE.md` completely, then read
-the actual implementation. Their public-run/scoring workflow is older than the
-current rules above. Main files:
-
-- `engine/engine.py`: loading and host token stream; only `Engine.__init__` and
-  `Engine.generate` are public entry points.
-- `engine/decode.py`: fixed KV buffers, native RoPE table, direct layer dispatch,
-  warmup, and one CUDA graph per `(batch, prompt_length, output_length)` shape.
-- `engine/attention.py`: grouped decode SDPA with no replicated KV heads.
-- `engine/layers.py`: packed QKV and packed gate/up projections (candidate 2).
-- `engine/kernels/rmsnorm.py`, `engine/kernels/swiglu.py`: fused kernels.
-- `agent/EXPERIMENTS.md`: hypotheses and measured results.
-- `agent/verify_gpu.py`: numerical checks intended for a GPU runtime; NOT run
-  locally. CPU tests cover only the generator contract, not GPU arithmetic.
-
-Baseline starter is commit `e35c206`. **Candidate 1, commit `0d92f17`, passed
-an official H100 run and ranked at 528.596 tokens/s**, with peak GPU memory
-13.943 GiB. All gates passed. Its implementation:
-
-1. Load native BF16 weights, TF32 disabled. Preserve native matrix products.
-2. Replace all hidden and Q/K RMSNorms with the fused Triton kernel.
-3. Preallocate KV `[B, 8, prompt+output, 128]` per layer. Prefill copies K/V into
-   the prefix but returns only fresh prompt K/V to native causal SDPA.
-4. Decode writes K/V with GPU-position `index_copy_`. Fixed-capacity attention
-   uses an explicit GPU mask `arange(capacity) <= position`, updated in the graph.
-5. For single-token decode, reshape Q `[B,32,1,128]` to `[B,8,4,128]`, treating
-   query heads within each KV group as SDPA query rows. Attend directly against
-   `[B,8,C,128]` K/V. `is_causal=False`: these four rows are heads at the SAME
-   time position, not four successive tokens. This avoids native 4.51.3's
-   fourfold K/V materialization. Prefill stays on the native SDPA adapter.
-6. Precompute native RoPE cos/sin during warmup. Capture decode forward, argmax,
-   next-token copy, and position increment in one CUDA graph. Host `.tolist()`
-   and yield happen synchronously outside capture, one step at a time.
-7. During prefill, final norm and LM head process only the last hidden token.
-
-Candidate 1 official public measurements (five-sample medians):
-
-| Case | Candidate tok/s | Candidate TTFT ms | Native TTFT ms | Candidate TPOT ms | Native TPOT ms | Total speedup |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| public-0 | 132.324 | 18.962 | 22.405 | 7.203 | 18.027 | 2.403x |
-| public-1 | 274.978 | 162.859 | 203.514 | 9.767 | 21.198 | 1.847x |
-| public-2 | 1792.752 | 150.978 | 192.456 | 7.798 | 22.926 | 2.717x |
-
-**Candidate 2, commit `a339a7f`, passed at 541.648 tokens/s (+2.47%).** It packs
-Q/K/V into one BF16 linear projection with output width 6144, packs gate/up
-into one projection with output width 19456, and fuses SwiGLU while retaining
-the BF16 SiLU intermediate. Everything else is substantially unchanged.
-Packing occurs during load and releases the original separate weight tensors.
-Run ID: `b4e2dd03-7f39-43a4-a73f-f172128e55fb`. Public TPOT improved to
-6.741/9.558/7.558 ms; TTFT increased to 24.987/166.157/155.906 ms, with every
-gate passing. Native times also moved between runs, so avoid attributing every
-timing difference to code alone.
-
-**Candidate 3 is being implemented:** decode-only fusion of Q/K head RMSNorm,
-RoPE and KV writes in `engine/kernels/qk_rope.py`. Coordinate before duplicating
-this work; research the next opportunities and adversarially review this kernel.
-
-## Research questions — prioritize these
-
-1. **Where is the remaining decode time plausibly spent?** Build a quantitative
-   lower-bound analysis from weight bytes, KV traffic, GEMM shapes, H100 HBM
-   bandwidth, and launch count. Separate measured facts from hypotheses; do not
-   invent a profiler trace. Account for the large tied LM head.
-2. **Small-batch matrix products:** when can a source-only Triton BF16 GEMV or
-   GEMM beat PyTorch/cuBLAS for these exact shapes? Consider B=1,4,16 plus other
-   possible batches. Propose tiling, split-K/reduction, coalescing, accumulation
-   precision and dispatch. Explain register pressure and why a hand-written
-   kernel might lose to cuBLAS. Is packed projection really the right layout?
-3. **Decode attention:** compare the current grouped SDPA trick against a custom
-   dense split-K attention kernel, including reading a device-side valid length,
-   online softmax, full-capacity mask overhead, and GQA reuse. Confirm the
-   backends actually available in torch 2.5.1. Do not recommend installing
-   FlashInfer or relying on unsupported `enable_gqa` behavior.
-4. **Safe fusion:** rank Q/K norm + RoPE + KV write, residual + norm, activation
-   epilogues, and LM-head argmax. Spell out every required BF16 cast and tensor
-   layout. Estimate attainable savings relative to development/numerical risk.
-5. **Prefill:** identify real opportunities without worsening TTFT. Consider
-   native SDPA backend selection, packed projections, temporary copies, and
-   chunking only if a quantitative benefit is credible.
-6. **Exact speculation:** evaluate whether deterministic n-gram/prompt lookup
-   or another legal draft can help without extra model weights. Describe exact
-   verification, batch acceptance, cache rollback, and streaming latency. State
-   the acceptance rate needed to beat the current engine; recommend against it
-   if the likely economics are poor.
-7. **Adversarial review:** identify concrete correctness or stability risks in
-   our current implementation and proposed changes, including state reuse,
-   graph capture, shape specialization, peak memory, and numeric drift.
-
-## Required deliverable
-
-Give us an actionable research report, not a broad literature survey:
-
-1. A ranked table of **5–8 specific opportunities** with expected mechanism,
-   affected workloads, rough gain range explicitly labeled as an estimate,
-   implementation effort, numerical risk, and runtime compatibility.
-2. The **best three experiments**, in recommended execution order. For each:
-   exact code/module boundary, algorithm or kernel pseudocode, tensor shapes,
-   launch strategy, cast boundaries, correctness tests, and go/no-go benchmark
-   criteria. Make the experiments separable so a result can be attributed.
-3. Primary-source links with pinned versions or commits and the precise claim
-   each supports. Distinguish portable ideas from implementations requiring
-   Hopper-specific compiled CUDA extensions or newer Triton/PyTorch features.
-4. A short section of **ideas to reject or defer**, with concrete reasons.
-5. Any uncertainty that needs an actual H100 measurement; ask for the smallest
-   useful measurement instead of presenting speculation as a fact.
-
-Prefer a small, measurable improvement we can implement and validate next over
-an ambitious redesign with no credible latency or correctness argument.
-
-If you share the repository: work read-only on `engine/`, do not commit or push,
-do not start/cancel official runs, do not read `.env` or credentials, and do not
-modify the active candidate. Put your report under `agent/research/` or return
-it in your response. Coordinate with the implementing agent before any edits.
+For each idea give: mechanism; expected gain for batch 1, 4 and 16 with explicit arithmetic from my measured numbers; exactness class (pure reordering / draft-only / numerics change); implementation sketch under the constraints (fixed shapes inside a CUDA graph, Triton only, warmup budget in seconds); how I could pre-test it WITHOUT a GPU (I have the real model on an Apple-silicon Mac for acceptance simulation, a patched Triton interpreter that executes kernels on CPU, and offline H100 compilation); and the sources. Finish with a ranked top-10 by expected gain x probability of success / implementation cost, and a short list of things you checked that turned out to be worthless so I do not repeat them.

@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 
 from kernels.tune import register
+from kernels.merged import Split
 
 
 @triton.jit
@@ -82,7 +83,7 @@ def _merge_projection(
     tl.store(out_ptr + offsets, tl.sum(values, axis=0), offsets < COUNT)
 
 
-def _project(x, weight, config):
+def _project(x, weight, config, split_ok=False):
     kind, block_n, block_k, splits, warps = config
     m, k = x.shape
     n = weight.shape[0]
@@ -100,6 +101,8 @@ def _project(x, weight, config):
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=16 if m <= 16 else 32,
             num_warps=warps, num_stages=2,
         )
+    if splits > 1 and split_ok:
+        return Split(partial, (m, n))
     if splits > 1:
         _merge_projection[(triton.cdiv(m * n, 512),)](
             partial, out, COUNT=m * n, SPLITS=splits,
@@ -205,7 +208,7 @@ def _choose(x, weight):
     return best
 
 
-def linear(x, weight):
+def linear(x, weight, split_ok=False):
     rows = x.numel() // x.shape[-1]
     if rows > MAX_ROWS or x.dtype != torch.bfloat16 or not weight.is_contiguous():
         return F.linear(x, weight)
@@ -224,4 +227,8 @@ def linear(x, weight):
     choice = _CHOICES[key]
     if choice is None:
         return F.linear(x, weight)
-    return _project(flat, weight, choice).reshape(*x.shape[:-1], weight.shape[0])
+    result = _project(flat, weight, choice, split_ok=split_ok)
+    if isinstance(result, Split):
+        result.shape = (*x.shape[:-1], weight.shape[0])
+        return result
+    return result.reshape(*x.shape[:-1], weight.shape[0])

@@ -157,7 +157,7 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None, e
             attention, residual, layer.post_attention_layernorm.weight,
             layer.post_attention_layernorm.variance_epsilon,
         )
-        hidden = layer.mlp(normalized)
+        hidden = layer.mlp(normalized, split_ok=every)
     if every:
         normalized, _ = add_rms_norm(hidden, residual, base.norm.weight, base.norm.variance_epsilon)
         return linear(normalized, model.lm_head.weight)

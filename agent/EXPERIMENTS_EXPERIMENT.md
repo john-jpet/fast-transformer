@@ -73,3 +73,35 @@ read-only reviews found no concrete blocker; their probe-coverage comment was
 addressed by checking all-full chains, all-alternative trees, and mixed rows
 with varying positions. The existing compile_spec.py signature was updated.
 GPU correctness and warmup/throughput remain unmeasured.
+
+## Results — E01/E02 keep
+
+Baseline b0e2d76: 1063.550 tokens/s, all gates passed.
+E01 416fc34: 1072.484 tokens/s (+0.84%). Public rates 311.2/533.6/3171.9
+versus baseline 304.4/521.2/3118.5; all public decode times improved, so keep
+despite the sub-1% aggregate delta. Prefill did not improve measurably.
+E02 065f18f: 1087.324 tokens/s (+1.38% over E01, +2.24% over baseline).
+Public rates 307.4/527.5/3245.9; largest signal public-2 TPOT 4.119 ms versus
+4.224 ms. All gates passed, peak memory 16.011 GB, run 663 s. Keep.
+Raw reports and TSV are in agent/results/ and ignored agent/results.tsv.
+
+## E03 — downstream consumers merge split projections
+
+Live comparison: SSS 1095.135 versus dryfter 1087.324 (gap 0.72%). Their
+origin/main at 80d38ef includes our earlier fused MLP and single-pass attention,
+plus merge-free projection consumers, two-context draft table and dynamic block
+selection. Their best measured commit is b1ca1cc; later mask-free/transposed
+GEMM changes have no reported result yet. Avoid treating unmeasured code as a win.
+
+Port the measured b1ca1cc merged.py, residual-add norm and QK/RoPE consumers.
+Adapt our linear and layer plumbing to pass FP32 split partials directly during
+verification; keep our own fused gate/up backend. Hypothesis: remove three
+merge launches per layer (up to 108 per verifier pass), lowering TPOT without
+changing block shapes, drafting, or prefill. Preserve BF16 projection rounding
+before norm/residual/rotation. FP32 split-add order changes within the contract.
+Full-model correctness still requires our own run of the combined stack.
+
+E03 checks passed: 24 CPU consumer indexing/cast cases, 16 SM90 consumer
+specializations, 10 protocol/client tests, archive validator, both independent
+read-only reviews. Review confirms Split never reaches the ordinary final-token
+slicing path and consumers retain partial allocations through their launches.

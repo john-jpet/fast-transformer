@@ -146,7 +146,8 @@ def _graph_time(fn):
 
 
 _CONFIGS = {}
-_TUNING_SECONDS = 10.0
+_BLOCK_LAYOUTS = {}
+_TUNING_SECONDS = 0.0  # the plain-decode layout search never found a winner; keep the default
 
 
 def _choose(query, key, value, position, scale):
@@ -276,10 +277,13 @@ def _block_partials(
         accumulator = tl.dot(probabilities.to(tl.bfloat16), value, accumulator)
         maximum = next_maximum
     if SPLITS == 1:
-        # The whole prefix was reduced in this program. Write token-major
-        # final values directly, without partial storage or a merge launch.
-        tl.store(out_ptr + q_offset[:, None] + dims[None, :],
-                 accumulator / denominator[:, None], live[:, None])
+        # One interval covers the whole prefix: normalize and write the final
+        # token-major output here; no partial storage, no merge launch.
+        # (Single-pass path contributed by john-jpet's fork.)
+        tl.store(
+            out_ptr + q_offset[:, None] + dims[None, :],
+            accumulator / denominator[:, None], live[:, None],
+        )
     else:
         slot = (group * SPLITS + split) * (TOKENS * GROUPS) + members
         tl.store(partial_ptr + slot[:, None] * DIM + dims[None, :], accumulator, live[:, None])
@@ -312,16 +316,45 @@ def _block_merge(
     tl.store(out_ptr + index * DIM + dims, numerator / denominator)
 
 
-def _block_attend(query, key, value, position, scale, chain, config):
+def block_attention(query, key, value, position, scale, chain):
+    """Verify blocks: token-major Q [B,T,Hq,D], KV [B,Hkv,C,D], position [B] -> [B,T,Hq,D].
+
+    Token t of row b occupies slot ``position[b] + t``. The first ``chain[b]``
+    tokens attend causally; the rest are alternatives to token 1 and attend to
+    the prefix through token 0 plus themselves. The block's own keys must
+    already be in the cache.
+    """
     batch, tokens, query_heads, dim = query.shape
     kv_heads, capacity = key.shape[1:3]
+    assert key.shape[0] == batch and query_heads % kv_heads == 0
+    assert query.dtype == key.dtype == value.dtype == torch.bfloat16
+    assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
+    assert value.shape == key.shape and key.shape[3] == dim and dim in (64, 128)
+    assert position.shape == (batch,) and position.dtype == torch.int64
+    assert chain.shape == (batch,) and chain.dtype == torch.int64
     groups = query_heads // kv_heads
     members = tokens * groups
-    block_n, splits, warps = config
+    shape = (query.device, batch, tokens, query_heads, kv_heads, capacity, dim)
+    if shape not in _BLOCK_LAYOUTS:
+        # Start from the decode default; the captured verify graph re-judges
+        # the alternatives (same dense attention, different interval tiling).
+        default = _default_config(batch, kv_heads, capacity)
+        options = [default]
+        for block_n, splits in ((64, 1), (128, 1), (128, default[1] // 2), (64, default[1] * 2), (128, default[1])):
+            option = (block_n, max(1, min(32, splits, triton.cdiv(capacity, block_n))), 4)
+            if option not in options:
+                options.append(option)
+        _BLOCK_LAYOUTS[shape] = default
+        if not torch.cuda.is_current_stream_capturing():
+            register(
+                ("block_attention",) + shape[1:], batch * tokens, 1 << 41, options,
+                lambda: _BLOCK_LAYOUTS[shape], lambda option: _BLOCK_LAYOUTS.__setitem__(shape, option),
+            )
+    block_n, splits, warps = _BLOCK_LAYOUTS[shape]
     chunk = triton.cdiv(capacity, splits)
     out = torch.empty((batch, tokens, query_heads, dim), device=query.device, dtype=query.dtype)
     if splits == 1:
-        partial = stats = out  # Unused pointers in this compiled specialization.
+        partial = stats = out  # unused pointers in that specialization
     else:
         partial = torch.empty((batch * kv_heads, splits, members, dim), device=query.device, dtype=torch.float32)
         stats = torch.empty((batch * kv_heads, splits, members, 2), device=query.device, dtype=torch.float32)
@@ -339,73 +372,3 @@ def _block_attend(query, key, value, position, scale, chain, config):
             DIM=dim, SPLITS=splits, BLOCK_S=triton.next_power_of_2(splits), num_warps=4,
         )
     return out
-
-
-_BLOCK_CONFIGS = {}
-
-
-def _choose_block(query, key, value, position, scale, chain):
-    batch, tokens, heads, dim = query.shape
-    kv_heads, capacity = key.shape[1:3]
-    default = _default_config(batch, kv_heads, capacity)
-    deadline = time.monotonic() + 6.0
-    generator = torch.Generator(device=query.device).manual_seed(16180)
-    q = torch.randn(query.shape, device=query.device, dtype=query.dtype, generator=generator)
-    k = torch.randn(key.shape, device=key.device, dtype=key.dtype, generator=generator)
-    v = torch.randn(value.shape, device=value.device, dtype=value.dtype, generator=generator)
-    # Test full chains and all-alternative trees even at batch one, plus a
-    # mixed batch. Positions also differ; probes never mutate real KV state.
-    position = (position - 3 * torch.arange(batch, device=query.device)).clamp_min(0)
-    chains = torch.arange(batch, device=query.device, dtype=torch.int64) % tokens + 1
-    patterns = [torch.ones_like(chains), torch.full_like(chains, tokens), chains]
-    references = [_block_attend(q, k, v, position, scale, pattern, default) for pattern in patterns]
-    options = [default]
-    best = default
-    best_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, default))
-    candidates = [(64, 1, 4), (128, max(1, default[1] // 2), 4), (64, max(1, default[1] // 2), 4)]
-    for config in candidates:
-        if config in options or time.monotonic() >= deadline:
-            continue
-        if not all(
-            torch.allclose(_block_attend(q, k, v, position, scale, pattern, config).float(),
-                           reference.float(), atol=0.02, rtol=0.02)
-            for pattern, reference in zip(patterns, references)
-        ):
-            continue
-        options.append(config)
-        elapsed = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, config))
-        if elapsed < best_ms * 0.97:
-            best, best_ms = config, elapsed
-    if best != default:
-        native_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, default))
-        best_ms = _graph_time(lambda: _block_attend(q, k, v, position, scale, chains, best))
-        if best_ms >= native_ms * 0.97:
-            best = default
-    print(f"block attention warmup: batch={batch} tokens={tokens} layout={best} default={default}", flush=True)
-    return best, options
-
-
-def block_attention(query, key, value, position, scale, chain):
-    """Dense tree verification: Q [B,T,Hq,D], KV [B,Hkv,C,D] -> [B,T,Hq,D].
-
-    Each row's first chain[b] slots are causal, remaining slots are alternative
-    first drafts. All choices use the same mask and every valid cached key.
-    """
-    batch, tokens, query_heads, dim = query.shape
-    kv_heads, capacity = key.shape[1:3]
-    assert key.shape[0] == batch and query_heads % kv_heads == 0
-    assert query.dtype == key.dtype == value.dtype == torch.bfloat16
-    assert query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
-    assert value.shape == key.shape and key.shape[3] == dim and dim in (64, 128)
-    assert position.shape == (batch,) and position.dtype == torch.int64
-    assert chain.shape == (batch,) and chain.dtype == torch.int64
-    shape = (query.device, batch, tokens, query_heads, kv_heads, capacity, dim)
-    if shape not in _BLOCK_CONFIGS:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("block attention selection must finish during eager warmup")
-        _BLOCK_CONFIGS[shape], options = _choose_block(query, key, value, position, scale, chain)
-        register(
-            ("block_attention", *shape[1:]), batch * tokens, 1 << 40, options,
-            lambda: _BLOCK_CONFIGS[shape], lambda config: _BLOCK_CONFIGS.__setitem__(shape, config),
-        )
-    return _block_attend(query, key, value, position, scale, chain, _BLOCK_CONFIGS[shape])

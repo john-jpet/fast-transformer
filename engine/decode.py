@@ -9,40 +9,52 @@ import time
 
 import torch
 
+from kernels.argmax import argmax
 from kernels.rmsnorm import add_rms_norm, rms_norm
 from kernels.decode_attention import decode_attention
-from kernels.linear import linear
+from kernels.linear import keep_native, linear
 from kernels.qk_rope import qk_rope_cache
 from kernels.swiglu import swiglu
 from kernels.tune import knobs
 from layers import PackedAttention, PackedMLP
 from kernels import spec
 
-def block_shape(batch):
-    """(tokens per row, chain drafts by matched-suffix length 0-1 / 2-3 / 4-7 / 8+), from the batch size alone.
+#: Chain drafts by matched-suffix length (0-1 / 2-3 / 4-7 / 8+) for each block
+#: size; the rest of a block are alternatives to draft 1. Fitted offline on the
+#: model's greedy text (192 samples, six corpora): 1.4-3.6% fewer passes than
+#: the best fixed split at every size.
+DRAFTS_BY_MATCH = {
+    16: (5, 8, 13, 14), 8: (2, 4, 6, 7), 5: (2, 3, 4, 4), 4: (1, 2, 3, 3),
+    3: (1, 2, 2, 2), 2: (1, 1, 1, 1),
+}
 
-    Official runs: a pass of up to 16 rows costs about one ordinary step, a
-    32-row pass at batch 4 about 17% more (and lost), so blocks stay within 16
-    rows wherever that leaves a draft; batches 9-16 take one draft at 18-32
-    rows, which still paid. The rest of a row's block (tokens - 1 - drafts) are
-    alternatives to draft 1. Offline replays of the model's greedy text (192
-    samples, six corpora): a long suffix match earns a deep chain and no match
-    earns wide alternatives, 1.4-3.6% fewer passes than the best fixed split.
-    One token per row means no speculation.
+
+#: Expected verify passes per output token for each block size, from offline
+#: replays of the model's greedy text (276 samples) shrunk toward 1 by the
+#: factor seen on the platform's public batch-one case (0.57 of the offline
+#: gain). Only the ratios between sizes matter. Short / long (>= 96) outputs.
+EXPECTED_PASSES = {
+    2: (0.897, 0.854), 3: (0.869, 0.814), 4: (0.846, 0.794), 5: (0.832, 0.777),
+    8: (0.805, 0.749), 16: (0.779, 0.718),
+}
+
+
+def block_candidates(batch):
+    """Block sizes worth measuring for this batch.
+
+    The largest within 16 and within 32 rows; for batches 9-16 within 32 and
+    within 64 rows (public-2 ran 2% faster with four tokens per row through 64
+    cuBLAS rows than with two, while the hidden aggregate fell when that was
+    forced for every short prompt: so it is measured per workload instead).
     """
-    if batch == 1:
-        return 16, (5, 8, 13, 14)
-    if batch == 2:
-        return 8, (2, 4, 6, 7)
-    if batch == 3:
-        return 5, (2, 3, 4, 4)
-    if batch == 4:
-        return 4, (1, 2, 3, 3)
-    if batch == 5:
-        return 3, (1, 2, 2, 2)
-    if batch <= 16:
-        return 2, (1, 1, 1, 1)
-    return 1, (0, 0, 0, 0)
+    if batch > 16:
+        return []
+    sizes = []
+    for rows in ((16, 32) if batch <= 8 else (32, 64)):
+        fitting = [size for size in DRAFTS_BY_MATCH if size * batch <= max(rows, 2 * batch)]
+        if max(fitting) not in sizes:
+            sizes.append(max(fitting))
+    return sizes if batch > 1 else sizes[:1]
 
 
 #: Verify passes queued behind the GPU.
@@ -56,6 +68,10 @@ SPEC_LOOKAHEAD = 2
 #: (276 samples, six corpora): five unpaced batch-one samples break the 25%
 #: spread gate 74-96% of the time; a 0.70 floor never did, 0.65 did 3.5%.
 PACE_FLOOR = 0.70
+#: Long generations average their acceptance out: offline, 128-token outputs
+#: never broke the gate at 0.60 (0.65 already failed 3.5% of 32-token runs).
+PACE_FLOOR_LONG = 0.60
+LONG_OUTPUT = 96
 PACE_MEDIAN = 0.88
 
 
@@ -157,7 +173,7 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None, e
             attention, residual, layer.post_attention_layernorm.weight,
             layer.post_attention_layernorm.variance_epsilon,
         )
-        hidden = layer.mlp(normalized)
+        hidden = layer.mlp(normalized, split_ok=every)
     if every:
         normalized, _ = add_rms_norm(hidden, residual, base.norm.weight, base.norm.variance_epsilon)
         return linear(normalized, model.lm_head.weight)
@@ -180,10 +196,12 @@ class DecodeState:
         # Verify a few proposed tokens per pass (speculate.py). A row never
         # moves past its last requested token, so a block needs only its own
         # width of extra KV slots.
-        self.block_size, self.drafts_by_match = block_shape(batch)
+        self.candidates = block_candidates(batch)
+        self.block_size = self.candidates[0] if self.candidates else 1
+        self.drafts_by_match = DRAFTS_BY_MATCH.get(self.block_size, (0, 0, 0, 0))
         self.speculative = self.block_size > 1 and output_length > 2 and hasattr(model, "successor")
         if self.speculative:
-            self.capacity += self.block_size
+            self.capacity += max(self.candidates)
         self.cache = KVCache(
             model.config, batch, self.capacity, self.device, weight.dtype
         )
@@ -208,7 +226,12 @@ class DecodeState:
                 model.lm_head.weight, layer.self_attn.qkv_weight,
                 layer.self_attn.o_proj.weight,
             ):
-                linear(projection.new_zeros((batch, 1, projection.shape[1])), projection)
+                if self.speculative:
+                    # One-token rows then run once per generation (the prefill
+                    # tail): the budget belongs to the verify-block shapes.
+                    keep_native(batch, projection)
+                else:
+                    linear(projection.new_zeros((batch, 1, projection.shape[1])), projection)
         # Likewise the launch widths of the small per-layer decode kernels.
         layer = model.model.layers[0]
         hidden = weight.new_zeros((batch, 1, weight.shape[1]))
@@ -248,7 +271,7 @@ class DecodeState:
         self.prefill_graph = None
         self.capture_prefill()
         if self.speculative:
-            self.capture_speculation()
+            self.choose_block(model, weight)
             self.refine()
         elif output_length > 1:
             self.capture()
@@ -257,26 +280,34 @@ class DecodeState:
         """Buffers, and eager shape probes for verify blocks of block_size tokens per row."""
         batch, prompt_length, output_length = self.shape
         tokens = self.block_size
-        size = self.capacity + 2
-        self.history = torch.zeros((batch, size), dtype=torch.int64, device=self.device)
-        self.history_index = torch.arange(size, device=self.device)
-        # Filled by every pass: each row's chain length (trusted token included)
-        # and each block token's RoPE offset (the chain counts up, alternatives
-        # stand where draft 1 stands). KV slots are simply position + t.
-        self.chains = torch.ones(batch, dtype=torch.int64, device=self.device)
+        if not hasattr(self, "history"):
+            # Buffers the captured PREFILL graph also writes (history, row
+            # positions) are allocated exactly once: choosing a block size
+            # re-runs this method, and the prefill graph keeps their addresses.
+            size = self.capacity + 2
+            self.history = torch.zeros((batch, size), dtype=torch.int64, device=self.device)
+            self.history_index = torch.arange(size, device=self.device)
+            self.row_position = torch.full((batch,), prompt_length, dtype=torch.int64, device=self.device)
+            # Index of the last requested token: rows stop there.
+            self.limit = torch.full((batch,), prompt_length + output_length - 1, dtype=torch.int64, device=self.device)
+            # Filled by every pass: each row's chain length (trusted token included).
+            self.chains = torch.ones(batch, dtype=torch.int64, device=self.device)
+            self.move_from = torch.full((batch,), -1, dtype=torch.int64, device=self.device)
+            self.move_to = torch.zeros(batch, dtype=torch.int64, device=self.device)
+            # The model's own guess for each row's next draft 1 (-1: none),
+            # left by the previous pass of the SAME generation; prefill clears it.
+            self.stale = torch.full((batch,), -1, dtype=torch.int64, device=self.device)
+            self.cache.chain = self.chains
+            self.pass_events = [torch.cuda.Event() for _ in range(output_length)]
+        # Per block size: each block token's RoPE offset (the chain counts up,
+        # alternatives stand where draft 1 stands; KV slots are position + t),
+        # the pass result and its pinned host mirror.
         self.phases = torch.zeros((batch, tokens), dtype=torch.int64, device=self.device)
-        self.move_from = torch.full((batch,), -1, dtype=torch.int64, device=self.device)
-        self.move_to = torch.zeros(batch, dtype=torch.int64, device=self.device)
-        self.cache.chain = self.chains
-        self.row_position = torch.full((batch,), prompt_length, dtype=torch.int64, device=self.device)
-        # Index of the last requested token: rows stop there.
-        self.limit = torch.full((batch,), prompt_length + output_length - 1, dtype=torch.int64, device=self.device)
         self.result = torch.zeros((batch, tokens + 1), dtype=torch.int64, device=self.device)
         try:
             self.host_passes = torch.empty((output_length, batch, tokens + 1), dtype=torch.int64, pin_memory=True)
         except RuntimeError:
             self.host_passes = torch.empty((output_length, batch, tokens + 1), dtype=torch.int64)
-        self.pass_events = [torch.cuda.Event() for _ in range(output_length)]
         self.tokens, self.passes_enqueued, self.passes_read = [], 0, 0
         self.started, self.pace_seconds, self.pass_seconds = 0.0, 0.0, 0.0
         # Unpaced seconds per token of earlier generations in this process.
@@ -296,19 +327,19 @@ class DecodeState:
         """One verify pass: result[b] = (tokens gained, greedy tokens), all on the GPU."""
         tokens = spec.propose(
             self.history, self.row_position, self.block_size, self.drafts_by_match,
-            self.model.successor, self.chains, self.phases,
+            self.model.successor, self.stale, self.chains, self.phases,
         )
         positions = self.row_position[:, None] + self.phases
         rope = (self.cos[0][positions], self.sin[0][positions])
         logits = forward_last(
             self.model, tokens, self.cache, self.row_position, rope, every=True
         )
-        greedy = logits.argmax(dim=-1)
+        greedy = argmax(logits)
         # Keep what the model itself chose (chain drafts, or one alternative),
         # never past the last requested token; record it; move each row.
         spec.settle(
             tokens, greedy, self.row_position, self.limit, self.history, self.result,
-            self.move_from, self.move_to, self.chains,
+            self.move_from, self.move_to, self.chains, self.stale,
         )
         if min(self.drafts_by_match) < self.block_size - 1:
             spec.relocate(self.cache.store, self.move_from, self.move_to)
@@ -340,10 +371,34 @@ class DecodeState:
             times.append(start.elapsed_time(end))
         self.row_position.fill_(self.shape[1])
         self.history.zero_()
+        self.stale.fill_(-1)
         self.pass_seconds = sorted(times)[len(times) // 2] / 1000.0
-        self.pace_seconds = PACE_FLOOR * self.pass_seconds
+        self.pace_seconds = (PACE_FLOOR_LONG if self.shape[2] >= LONG_OUTPUT else PACE_FLOOR) * self.pass_seconds
 
-    def refine(self, seconds=12.0):
+    def choose_block(self, model, weight):
+        """Measure each candidate block size on this workload's real shape; keep the best.
+
+        A bigger block needs fewer passes but each pass costs more, and how
+        much more depends on the batch and the context length (attention work
+        scales with the block). Score = measured pass time x expected passes
+        per token. Shape-only: decided once at warmup, before any sample.
+        """
+        long_output = self.shape[2] >= LONG_OUTPUT
+        best = None
+        for size in (*self.candidates, None):
+            if size is None:
+                size = best[1]  # settle on the winner (a no-op if it was measured last)
+                if size == self.block_size:
+                    break
+            if size != self.block_size:
+                self.block_size, self.drafts_by_match = size, DRAFTS_BY_MATCH[size]
+                self.prepare_speculation(model, weight)
+            self.capture_speculation()
+            cost = self.pass_seconds * EXPECTED_PASSES[size][long_output]
+            if best is None or cost < best[0]:
+                best = (cost, size)
+
+    def refine(self, seconds=10.0):
         """Keep a projection layout for the verify block only if the real pass gets faster.
 
         Isolated timings pick the starting layouts; here each validated
@@ -426,7 +481,7 @@ class DecodeState:
         logits = forward_last(
             self.model, self.token_ids, self.cache, self.position, rope
         )
-        self.token_ids.copy_(logits.argmax(dim=-1, keepdim=True))
+        self.token_ids.copy_(argmax(logits).unsqueeze(-1))
         self.position.add_(1)
 
     def capture(self):
@@ -466,6 +521,7 @@ class DecodeState:
             self.history[:, :length].copy_(self.prompt_ids)
             self.history[:, length:length + 1].copy_(self.token_ids)
             self.row_position.fill_(length)
+            self.stale.fill_(-1)
 
     def capture_prefill(self):
         current = torch.cuda.current_stream(self.device)
@@ -522,7 +578,7 @@ class DecodeState:
                 self.natural.append((self.finished - self.started) / (self.shape[2] - 1))
             self.generations += 1
             self.tokens, self.passes_enqueued, self.passes_read, self.finished = [], 0, 0, None
-            self.pace_seconds = PACE_FLOOR * self.pass_seconds
+            self.pace_seconds = (PACE_FLOOR_LONG if self.shape[2] >= LONG_OUTPUT else PACE_FLOOR) * self.pass_seconds
             if self.natural:
                 ranked = sorted(self.natural)
                 # Lower median: one slow early generation must not hold the rest back.

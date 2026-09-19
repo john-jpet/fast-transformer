@@ -112,3 +112,10 @@ on best E02 (ONLY attention.py differs). No argmax in this candidate.
 New unsubmitted fused-attention prototype in agent/lab compiles four SM90
 sizes; needs numerical/pointer/cache checks and reviews before engine integration.
 No measured architecture gain yet. See latest experiment sections.
+
+## Latest E11 baseline replacement
+Both isolated runs scored1066.9; discarded. Engine staged from measured
+SSS c096f57 (1129.718) exactly, to test complete integrated baseline.
+Silver best384edb3=1103.988 is essentially previous SSS baseline; later
+refine-before-compare lost and was reverted. Preserve clear attribution.
+C11 CPU/tree+SM90 checks pass. Fused prototype deferred (compile cost).

@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.merged import load_merged, source
 from kernels.tune import pick
 
 #: One row must fit in one block. Qwen3 4B norms 2560 columns (hidden) and 128
@@ -72,12 +73,13 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 def _add_rms_norm_kernel(
     x_ptr, residual_ptr, w_ptr, out_ptr, sum_ptr,
     WIDTH: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr,
+    COUNT: tl.constexpr = 1, SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
     valid = cols < WIDTH
     offset = row * WIDTH + cols
-    x = tl.load(x_ptr + offset, valid, other=0).to(tl.float32)
+    x = load_merged(x_ptr, offset, valid, COUNT, SPLITS).to(tl.float32)
     residual = tl.load(residual_ptr + offset, valid, other=0).to(tl.float32)
     # The residual addition is a BF16 tensor operation in the native layer.
     summed = (x + residual).to(tl.bfloat16)
@@ -91,23 +93,24 @@ def _add_rms_norm_kernel(
 
 def add_rms_norm(x, residual, weight, eps):
     """Return (normalized sum, BF16 sum), without mutating either input."""
-    assert x.shape == residual.shape
-    assert x.dtype == residual.dtype == weight.dtype == torch.bfloat16
-    shape = x.shape
+    x_data, splits, count, shape = source(x)
+    assert shape == tuple(residual.shape)
+    assert residual.dtype == weight.dtype == torch.bfloat16
+    assert x_data.dtype == (torch.bfloat16 if splits == 1 else torch.float32)
     width = shape[-1]
     block = triton.next_power_of_2(width)
     if block > MAX_BLOCK:
         raise ValueError(f"a row must fit in one block; {width} columns does not")
-    x_rows = x.reshape(-1, width).contiguous()
+    x_rows = x_data.reshape(-1, width).contiguous() if splits == 1 else x_data
     residual_rows = residual.reshape(-1, width).contiguous()
-    out = torch.empty_like(x_rows)
-    summed = torch.empty_like(x_rows)
-    rows = x_rows.shape[0]
+    out = torch.empty_like(residual_rows)
+    summed = torch.empty_like(residual_rows)
+    rows = residual_rows.shape[0]
 
     def launch(warps):
         _add_rms_norm_kernel[(rows,)](
             x_rows, residual_rows, weight, out, summed,
-            WIDTH=width, EPS=eps, BLOCK=block, num_warps=warps,
+            WIDTH=width, EPS=eps, BLOCK=block, COUNT=count, SPLITS=splits, num_warps=warps,
         )
 
     # Decode rows are launch-bound: measure the block width once per shape.

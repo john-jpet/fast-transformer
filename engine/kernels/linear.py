@@ -13,6 +13,8 @@ from torch.nn import functional as F
 import triton
 import triton.language as tl
 
+from kernels.gemm import _exact_gemm, _trans_gemm, exact_splits
+from kernels.merged import Split
 from kernels.tune import register
 
 
@@ -82,7 +84,7 @@ def _merge_projection(
     tl.store(out_ptr + offsets, tl.sum(values, axis=0), offsets < COUNT)
 
 
-def _project(x, weight, config):
+def _project(x, weight, config, split_ok=False):
     kind, block_n, block_k, splits, warps = config
     m, k = x.shape
     n = weight.shape[0]
@@ -94,12 +96,25 @@ def _project(x, weight, config):
             x, weight, partial, N=n, K=k, SPLITS=splits, CHUNK=chunk,
             BLOCK_N=block_n, BLOCK_K=block_k, num_warps=warps,
         )
-    else:
+    elif kind == "gemm":
         _skinny_gemm[(triton.cdiv(n, block_n), splits)](
             x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=16 if m <= 16 else 32,
             num_warps=warps, num_stages=2,
         )
+    else:
+        # kernels/gemm.py: each mask exists only where that axis is ragged.
+        block_m = 16 if m <= 16 else 32
+        (_exact_gemm if kind == "exact" else _trans_gemm)[(triton.cdiv(n, block_n), splits)](
+            x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
+            BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m,
+            EVEN_M=m == block_m, EVEN_N=n % block_n == 0, EVEN_K=splits * chunk == k,
+            WIDE=max(n * k, splits * m * n) + 2 * block_n * max(k, m) >= 2 ** 31,
+            num_warps=warps, num_stages=2,
+        )
+    if splits > 1 and split_ok:
+        # The consumer kernel sums and rounds the partials itself.
+        return Split(partial, (m, n))
     if splits > 1:
         _merge_projection[(triton.cdiv(m * n, 512),)](
             partial, out, COUNT=m * n, SPLITS=splits,
@@ -136,8 +151,8 @@ MAX_ROWS = 32
 _CHOICES = {}
 _VALIDATED = {}
 _TUNING_DEADLINE = None
-_PROCESS_SECONDS = 30.0
-_SHAPE_SECONDS = 8.0
+_PROCESS_SECONDS = 18.0
+_SHAPE_SECONDS = 6.0
 
 
 def _candidates(m, n, k):
@@ -147,6 +162,11 @@ def _candidates(m, n, k):
         splits = min(8, triton.next_power_of_2(triton.cdiv(512, triton.cdiv(n, block_n))))
         return ("gemm", block_n, block_k, splits, 4)
 
+    def tiled(kind, block_n, block_k):
+        # Whole-block splits: K=2560 takes 5 where the power of two left one
+        # of 8 split programs entirely masked; K=9728 takes 4.
+        return (kind, block_n, block_k, exact_splits(k, block_k, gemm(block_n, block_k)[3]), 4)
+
     configs = [gemm(64, 128)]
     if m == 1:
         configs += [("gemv", 8, 512, 1, 4), ("gemv", 16, 256, 1, 4)]
@@ -154,8 +174,41 @@ def _candidates(m, n, k):
         # Verify blocks fill most of the 16/32 input rows, so every tile reloads
         # a large x block: wider output tiles amortize it. Judged in the real
         # verify graph (DecodeState.refine), not only in isolation.
-        configs += [gemm(128, 128), gemm(256, 128)]
+        configs += [tiled("exact", 64, 128), tiled("trans", 64, 128), gemm(256, 128)]
     return configs
+
+
+def _agrees(probe, weight, config, reference):
+    """Operator sanity check; a layout that fails to compile or launch is simply not offered."""
+    try:
+        actual = _project(probe, weight, config).float()
+        return bool(((actual - reference.float()).abs() <= reference.float().abs() * 0.016 + 0.001).all())
+    except Exception as error:
+        print(f"BF16 projection layout {config} skipped: {error!r}", flush=True)
+        return False
+
+
+def _inherit(x, weight):
+    """Past the budget, a verify block takes the layout measured for this weight at another row count.
+
+    The second block size tried at warmup would otherwise run cuBLAS-only and
+    lose the comparison for that reason alone. The verify-graph refinement
+    still re-judges the layout against cuBLAS if this block size wins.
+    """
+    m, k = x.shape
+    n = weight.shape[0]
+    if m <= 4:
+        return None
+    for (device, rows, width, inner), config in list(_CHOICES.items()):
+        if config is None or device != x.device or rows <= 4 or (width, inner) != (n, k):
+            continue
+        generator = torch.Generator(device=x.device).manual_seed(1729)
+        probe = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
+        if not _agrees(probe, weight, config, F.linear(probe, weight)):
+            continue
+        _VALIDATED[(x.device, m, n, k)] = [(0.0, config), (1.0, None)]
+        return config
+    return None
 
 
 def _choose(x, weight):
@@ -164,7 +217,7 @@ def _choose(x, weight):
     if _TUNING_DEADLINE is None:
         _TUNING_DEADLINE = now + _PROCESS_SECONDS
     if now >= _TUNING_DEADLINE:
-        return None
+        return _inherit(x, weight)
     # Every workload is a fresh process: bound each shape and the process so
     # compilation fits the load/warmup and whole-run budgets, and so one slow
     # shape cannot leave the later projections unmeasured.
@@ -184,11 +237,9 @@ def _choose(x, weight):
     for config in configs:
         if time.monotonic() >= shape_deadline:
             break
-        actual = _project(probe, weight, config)
         # Reject a kernel that fails an operator sanity check. Full-model
         # correctness still comes from the platform's own-prefix replay.
-        close = (actual.float() - reference.float()).abs() <= reference.float().abs() * 0.016 + 0.001
-        if not bool(close.all()):
+        if not _agrees(probe, weight, config, reference):
             continue
         elapsed = _cold_graph_time(lambda: _project(x, weight, config), flush)
         validated.append((elapsed, config))
@@ -205,7 +256,13 @@ def _choose(x, weight):
     return best
 
 
-def linear(x, weight):
+def keep_native(rows, weight):
+    """Leave a shape on cuBLAS without spending tuning budget on it."""
+    _CHOICES.setdefault((weight.device, rows, weight.shape[0], weight.shape[1]), None)
+
+
+def linear(x, weight, split_ok=False):
+    """x @ weight.T in BF16. With ``split_ok`` the result may be a ``Split`` for a consumer kernel."""
     rows = x.numel() // x.shape[-1]
     if rows > MAX_ROWS or x.dtype != torch.bfloat16 or not weight.is_contiguous():
         return F.linear(x, weight)
@@ -216,12 +273,19 @@ def linear(x, weight):
             raise RuntimeError("projection selection must finish during eager warmup")
         _CHOICES[key] = _choose(flat, weight)
         # None is cuBLAS. The captured decode step re-judges these layouts.
+        # Refinement order = weight traffic per step: the vocabulary projection
+        # runs once, every other projection once per layer (36 here).
+        traffic = weight.shape[0] * weight.shape[1] // (36 if weight.shape[0] > 65536 else 1)
         register(
-            ("projection",) + key[1:], rows, weight.shape[0] * weight.shape[1],
+            ("projection",) + key[1:], rows, traffic,
             [config for _, config in sorted(_VALIDATED.get(key, ()), key=lambda item: item[0])],
             lambda: _CHOICES[key], lambda config: _CHOICES.__setitem__(key, config),
         )
     choice = _CHOICES[key]
     if choice is None:
         return F.linear(x, weight)
-    return _project(flat, weight, choice).reshape(*x.shape[:-1], weight.shape[0])
+    result = _project(flat, weight, choice, split_ok)
+    if isinstance(result, Split):
+        result.shape = (*x.shape[:-1], weight.shape[0])
+        return result
+    return result.reshape(*x.shape[:-1], weight.shape[0])

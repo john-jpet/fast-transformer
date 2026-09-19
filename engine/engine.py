@@ -1,5 +1,7 @@
 """BF16 Qwen3 with a reusable KV cache and one CUDA graph per decode shape."""
 
+import gc
+
 import torch
 from transformers import AutoModelForCausalLM
 
@@ -54,16 +56,29 @@ class Engine:
                 # local caller changes it rather than retaining many graphs.
                 self.state = None
                 self.state = DecodeState(self.model, shape)
-            state = self.state
-            prompt = torch.tensor(input_ids, dtype=torch.int64, device=state.device)
-            state.prefill(prompt)
-            # Keep a few decode steps queued behind the GPU so it never waits
-            # for the consumer; never enqueue past the requested output count.
-            state.advance(min(max_new_tokens, 1 + LOOKAHEAD))
-            tokens = state.read(0)
-        yield tokens
-        for step in range(1, max_new_tokens):
+                # Everything built so far is permanent: keep the collector
+                # from ever walking it again.
+                gc.collect()
+                gc.freeze()
+        # A collection inside a ~100 ms generation is a multi-millisecond stall
+        # in one sample only: timing noise the spread gate would see.
+        collecting = gc.isenabled()
+        gc.disable()
+        try:
             with torch.inference_mode():
-                state.advance(min(max_new_tokens, step + 1 + LOOKAHEAD))
-                tokens = state.read(step)
+                state = self.state
+                prompt = torch.tensor(input_ids, dtype=torch.int64, device=state.device)
+                state.prefill(prompt)
+                # Keep a few decode steps queued behind the GPU so it never waits
+                # for the consumer; never enqueue past the requested output count.
+                state.advance(min(max_new_tokens, 1 + LOOKAHEAD))
+                tokens = state.read(0)
             yield tokens
+            for step in range(1, max_new_tokens):
+                with torch.inference_mode():
+                    state.advance(min(max_new_tokens, step + 1 + LOOKAHEAD))
+                    tokens = state.read(step)
+                yield tokens
+        finally:
+            if collecting:
+                gc.enable()

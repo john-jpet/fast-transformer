@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from kernels.merged import load_merged, source
 from kernels.tune import pick
 
 
@@ -13,7 +14,7 @@ def _qk_rope_cache(
     Q_HEADS: tl.constexpr, KV_HEADS: tl.constexpr, DIM: tl.constexpr,
     CAPACITY: tl.constexpr, Q_EPS: tl.constexpr, K_EPS: tl.constexpr,
     TOKENS: tl.constexpr, PREFILL: tl.constexpr, BLOCK: tl.constexpr,
-    ROWS: tl.constexpr = False,
+    ROWS: tl.constexpr = False, COUNT: tl.constexpr = 1, SPLITS: tl.constexpr = 1,
 ):
     row = tl.program_id(0).to(tl.int64)
     batch = row // TOKENS
@@ -24,8 +25,8 @@ def _qk_rope_cache(
     paired = (col + DIM // 2) % DIM
     packed_row = row * (Q_HEADS + 2 * KV_HEADS) * DIM
     offset = packed_row + head * DIM
-    x = tl.load(packed + offset + col, valid, other=0).to(tl.float32)
-    x_pair = tl.load(packed + offset + paired, valid, other=0).to(tl.float32)
+    x = load_merged(packed, offset + col, valid, COUNT, SPLITS).to(tl.float32)
+    x_pair = load_merged(packed, offset + paired, valid, COUNT, SPLITS).to(tl.float32)
     variance = tl.sum(x * x, axis=0) / DIM
     eps = tl.where(head < Q_HEADS, Q_EPS, K_EPS)
     inv_std = tl.rsqrt(variance + eps)
@@ -70,7 +71,7 @@ def _qk_rope_cache(
         cache_offset = ((batch * KV_HEADS + kv_head) * CAPACITY + pos) * DIM + col
         tl.store(keys + cache_offset, result, valid)
         value_offset = packed_row + (Q_HEADS + KV_HEADS + kv_head) * DIM + col
-        value = tl.load(packed + value_offset, valid, other=0)
+        value = load_merged(packed, value_offset, valid, COUNT, SPLITS)
         tl.store(values + cache_offset, value, valid)
 
 
@@ -82,10 +83,12 @@ def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_he
     view of token-major Q storage (contiguous when T is one).
     """
     batch, kv_heads, capacity, dim = keys.shape
-    tokens = packed.shape[1]
-    assert packed.dtype == keys.dtype == values.dtype == torch.bfloat16
+    packed, splits, count, shape = source(packed)
+    tokens = shape[1]
+    assert keys.dtype == values.dtype == torch.bfloat16
+    assert packed.dtype == (torch.bfloat16 if splits == 1 else torch.float32)
     assert packed.is_contiguous() and keys.is_contiguous() and values.is_contiguous()
-    assert packed.shape == (batch, tokens, (q_heads + 2 * kv_heads) * dim)
+    assert shape == (batch, tokens, (q_heads + 2 * kv_heads) * dim)
     assert 0 < tokens <= capacity
     assert values.shape == keys.shape and dim % 2 == 0
     assert not (rows and prefill)
@@ -95,13 +98,14 @@ def qk_rope_cache(packed, q_norm, k_norm, cos, sin, position, keys, values, q_he
     assert position.dtype == torch.int64
     # Token-major storage: Flash then returns a token-major output, so the
     # caller's transpose back to [B,T,Hq,D] is already contiguous.
-    query = torch.empty((batch, tokens, q_heads, dim), device=packed.device, dtype=packed.dtype)
+    query = torch.empty((batch, tokens, q_heads, dim), device=packed.device, dtype=keys.dtype)
     def launch(warps):
         _qk_rope_cache[(batch * tokens, q_heads + kv_heads)](
             packed, q_norm.weight, k_norm.weight, cos, sin, position, query, keys, values,
             Q_HEADS=q_heads, KV_HEADS=kv_heads, DIM=dim, CAPACITY=capacity,
             Q_EPS=q_norm.variance_epsilon, K_EPS=k_norm.variance_epsilon,
             TOKENS=tokens, PREFILL=prefill, BLOCK=triton.next_power_of_2(dim), ROWS=rows,
+            COUNT=count, SPLITS=splits,
             num_warps=warps,
         )
 

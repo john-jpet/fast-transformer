@@ -261,3 +261,24 @@ line-by-line pointer/cast/cache emulation, adversarial review, full-model
 validation and bounded optional selection alongside split attention.
 Leader now Silver Bullet1103.988; SSS1097.653 (new6334ff5, +0.23% over prior,
 817s whole run). Their marginal gain alone does not establish a superior path.
+
+## E11: adopt complete measured SSS engine as competitive baseline
+SSS c096f57 scored1129.718 (+3.90% over our1087.324); Silver Bullet best
+384edb3 scored1103.988 and its own notes attribute difference from SSS's
+1097.7 equivalent baseline to run noise. Silver's refine-before-compare trial
+scored1102.318 and was discarded. Latest tip changes are not measured gains.
+SSS measured stack combines adaptive block sizing, layout inheritance and
+verify-focused tuning, merged consumers, stale-prediction siblings, two-context
+table, argmax, optional cuDNN and GC control. Cannot isolate each contribution
+from bundled results. Our previous cherry-picks did not reproduce the stack.
+E09 isolated argmax1066.895; E10 isolated prefill1066.929: discard both.
+E11 engine tree matches c096f57 EXACTLY (git diff --cached c096f57 -- engine
+empty). No unrelated competitor files imported. Preserve our history/notes.
+400 tree cases pass (1506 stale hints, 961 branches), nine SM90 speculation
+kernels compile, 10 protocol tests and archive validator pass. Subagent review
+attempt failed on usage limit; standalone Codex review requested separately.
+This is baseline reproduction, not an original optimization or guaranteed win.
+Fused-attention prototype deferred: rival independently reports excessive
+compile/warmup cost and limited application to unsplit attention. Next advance
+should start from this measured integrated baseline if our run confirms it.
+Standalone Codex review completed: exact snapshot verified, no concrete regression in block selection, stale reset or generator GC finalization.

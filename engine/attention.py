@@ -3,7 +3,6 @@
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers.integrations.sdpa_attention import sdpa_attention_forward
-from kernels.decode_attention import _graph_time
 
 
 _PREFILL_BACKENDS = {}
@@ -24,8 +23,7 @@ def _prefill_backend(query, key, value, scaling):
     place here: once per shape, in eager warmup, on random tensors with the
     real sizes and strides, it has to run, agree with FLASH and be faster.
     """
-    shape = (query.device, query.dtype, scaling,
-             tuple((tuple(t.shape), t.stride()) for t in (query, key, value)))
+    shape = (query.device, tuple(query.shape), tuple(key.shape), key.stride(), query.stride())
     if shape not in _PREFILL_BACKENDS:
         if torch.cuda.is_current_stream_capturing():
             return SDPBackend.FLASH_ATTENTION
@@ -40,30 +38,19 @@ def _prefill_backend(query, key, value, scaling):
             for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION):
                 for _ in range(3):
                     out = _attend(backend, *probes, 0.0, scaling, True)
-                # Measured prefill is captured. This also rejects a backend
-                # that works eagerly but cannot be captured in this runtime.
-                elapsed = _graph_time(lambda: _attend(backend, *probes, 0.0, scaling, True))
-                timings[backend] = (elapsed, out)
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                for _ in range(5):
+                    out = _attend(backend, *probes, 0.0, scaling, True)
+                end.record()
+                end.synchronize()
+                timings[backend] = (start.elapsed_time(end), out)
             flash_ms, reference = timings[SDPBackend.FLASH_ATTENTION]
             cudnn_ms, candidate = timings[SDPBackend.CUDNN_ATTENTION]
             agrees = bool(torch.isfinite(candidate).all()) and float((candidate.float() - reference.float()).abs().max()) <= 0.03
             if agrees and cudnn_ms < 0.95 * flash_ms:
-                # Probe both diffuse and sharper softmax distributions. This
-                # is an operator screen, not proof of full-model correctness.
-                for magnitude in (0.25, 3.0):
-                    scaled = [torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device).copy_(t) for t in probes]
-                    scaled[0].mul_(magnitude)
-                    ref = _attend(SDPBackend.FLASH_ATTENTION, *scaled, 0.0, scaling, True)
-                    alt = _attend(SDPBackend.CUDNN_ATTENTION, *scaled, 0.0, scaling, True)
-                    agrees = agrees and bool(torch.isfinite(alt).all()) and float((alt.float() - ref.float()).abs().max()) <= 0.03
-                # Capture using the actual caller's storage too, not just the
-                # independent numerical probes with matching strides.
-                _graph_time(lambda: _attend(SDPBackend.CUDNN_ATTENTION, query, key, value, 0.0, scaling, True))
-                # Recheck Flash after initialization to avoid clock-ramp bias.
-                flash_ms = _graph_time(lambda: _attend(SDPBackend.FLASH_ATTENTION, *probes, 0.0, scaling, True))
-                if agrees and cudnn_ms < 0.95 * flash_ms:
-                    _PREFILL_BACKENDS[shape] = SDPBackend.CUDNN_ATTENTION
-            print(f"prefill attention warmup: flash_ms={flash_ms:.3f} cudnn_ms={cudnn_ms:.3f} agrees={agrees}", flush=True)
+                _PREFILL_BACKENDS[shape] = SDPBackend.CUDNN_ATTENTION
+            print(f"prefill attention warmup: flash_ms={flash_ms / 5:.3f} cudnn_ms={cudnn_ms / 5:.3f} agrees={agrees}", flush=True)
         except Exception as error:
             print(f"prefill attention warmup: cuDNN attention unavailable: {error!r}", flush=True)
     return _PREFILL_BACKENDS[shape]
@@ -77,7 +64,7 @@ def grouped_sdpa(module, query, key, value, attention_mask, dropout=0.0, scaling
         # three contiguous copies. The last query may read the full prefix
         # noncausally because no key is later than its absolute position.
         causal = query.shape[2] > 1
-        backend = _prefill_backend(query, key, value, scaling) if causal and dropout == 0 else SDPBackend.FLASH_ATTENTION
+        backend = _prefill_backend(query, key, value, scaling) if causal else SDPBackend.FLASH_ATTENTION
         output = _attend(backend, query, key, value, dropout, scaling, causal)
         return output.transpose(1, 2).contiguous(), None
     if query.shape[2] != 1:

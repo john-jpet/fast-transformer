@@ -13,7 +13,7 @@ import triton.language as tl
 
 @triton.jit
 def _propose(
-    history, position, successor, tokens, chains, phases,
+    history, position, successor, stale, tokens, chains, phases,
     SIZE: tl.constexpr, TOKENS: tl.constexpr, MAXLEN: tl.constexpr,
     D0: tl.constexpr, D1: tl.constexpr, D2: tl.constexpr, D3: tl.constexpr,
     LANES: tl.constexpr, ALTERNATES: tl.constexpr,
@@ -69,6 +69,14 @@ def _propose(
         siblings = tl.full((BLOCK_S,), -1, tl.int64)
         count = tl.zeros((), tl.int32)
         after = tl.load(base + index + 1, one, other=-1)
+        # First alternative: what the model itself predicted at this position
+        # in the previous pass, right after that pass's first wrong draft (one
+        # token of its context was wrong, so it is a guess, never trusted).
+        # Offline on the model's greedy text: 2-3% fewer passes at 16 tokens.
+        hint = tl.load(stale + row)
+        seeded = (hint >= 0) & (hint != first) & (TOKENS - 1 - drafts >= 2)
+        siblings = tl.where((lanes == 0) & seeded, hint, siblings)
+        count += seeded.to(tl.int32)
         for _ in tl.static_range(ALTERNATES):
             taken = (after == first) | (tl.sum((after[:, None] == siblings[None, :]).to(tl.int32), axis=1) > 0)
             choice = tl.max(tl.where(one & (taken == 0), rank, -1), axis=0)
@@ -92,17 +100,18 @@ def _propose(
     tl.store(phases + row * TOKENS + slot, tl.where(slot <= drafts, slot, 1), slot < TOKENS)
 
 
-def propose(history, position, tokens_per_row, drafts_by_match, successor, chains, phases):
+def propose(history, position, tokens_per_row, drafts_by_match, successor, stale, chains, phases):
     """Per row: trusted token, chain drafts, alternatives (int64 [B, T]); fills ``chains`` and ``phases``."""
     batch, size = history.shape
     assert history.is_contiguous() and history.dtype == position.dtype == successor.dtype == torch.int64
     assert position.shape == (batch,) and successor.dim() == 2 and successor.is_contiguous()
     assert chains.shape == (batch,) and phases.shape == (batch, tokens_per_row) and phases.is_contiguous()
+    assert stale.shape == (batch,) and stale.dtype == torch.int64
     assert len(drafts_by_match) == 4 and all(1 <= d <= tokens_per_row - 1 for d in drafts_by_match)
     lanes = tokens_per_row - 1 - min(drafts_by_match)
     tokens = torch.empty((batch, tokens_per_row), dtype=torch.int64, device=history.device)
     _propose[(batch,)](
-        history, position, successor, tokens, chains, phases,
+        history, position, successor, stale, tokens, chains, phases,
         SIZE=size, TOKENS=tokens_per_row, MAXLEN=8,
         D0=drafts_by_match[0], D1=drafts_by_match[1], D2=drafts_by_match[2], D3=drafts_by_match[3],
         LANES=lanes, ALTERNATES=min(lanes, 3), TOP=successor.shape[1],
@@ -114,7 +123,7 @@ def propose(history, position, tokens_per_row, drafts_by_match, successor, chain
 
 @triton.jit
 def _settle(
-    tokens, greedy, position, limit, history, result, move_from, move_to, chains,
+    tokens, greedy, position, limit, history, result, move_from, move_to, chains, stale,
     SIZE: tl.constexpr, TOKENS: tl.constexpr, BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
@@ -135,6 +144,10 @@ def _settle(
     place = tl.load(position + row)
     room = tl.maximum(tl.load(limit + row) - place, 0)
     branch = (gained == 1) & (hit < TOKENS) & (room >= 2)
+    # After a wrong chain draft the model's output at that slot predicts the
+    # token after the new trusted one: the next pass tries it as an alternative.
+    guess = tl.load(greedy + row * TOKENS + tl.minimum(gained, TOKENS - 1))
+    tl.store(stale + row, tl.where((gained < CHAIN) & (branch == 0), guess, -1))
     gained = tl.minimum(tl.where(branch, 2, gained), room)
     bonus = tl.load(greedy + row * TOKENS + tl.minimum(hit, TOKENS - 1))
     emitted = tl.where(branch & (slot == 1), bonus, chosen)
@@ -148,15 +161,16 @@ def _settle(
     tl.store(position + row, place + gained)
 
 
-def settle(tokens, greedy, position, limit, history, result, move_from, move_to, chains):
+def settle(tokens, greedy, position, limit, history, result, move_from, move_to, chains, stale):
     """Accept, clamp at ``limit``, record emitted tokens, plan the KV move, advance; in place."""
     batch, count = tokens.shape
     assert tokens.is_contiguous() and greedy.is_contiguous() and history.is_contiguous() and result.is_contiguous()
     assert greedy.shape == tokens.shape and result.shape == (batch, count + 1) and chains.shape == (batch,)
     assert tokens.dtype == greedy.dtype == position.dtype == limit.dtype == history.dtype == result.dtype == torch.int64
     assert move_from.dtype == move_to.dtype == torch.int64 and move_from.shape == move_to.shape == (batch,)
+    assert stale.shape == (batch,) and stale.dtype == torch.int64
     _settle[(batch,)](
-        tokens, greedy, position, limit, history, result, move_from, move_to, chains,
+        tokens, greedy, position, limit, history, result, move_from, move_to, chains, stale,
         SIZE=history.shape[1], TOKENS=count, BLOCK=triton.next_power_of_2(count), num_warps=1,
     )
 

@@ -13,7 +13,7 @@ from torch.nn import functional as F
 import triton
 import triton.language as tl
 
-from kernels.gemm import _exact_gemm, _trans_gemm, exact_splits
+from kernels.gemm import _exact_gemm, _hoist_gemm, _trans_gemm, exact_splits
 from kernels.merged import Split
 from kernels.tune import register
 
@@ -102,6 +102,16 @@ def _project(x, weight, config, split_ok=False):
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=16 if m <= 16 else 32,
             num_warps=warps, num_stages=2,
         )
+    elif kind == "hoist":
+        # Four weight tiles per program share each x-tile load.
+        block_m = 16 if m <= 16 else 32
+        _hoist_gemm[(triton.cdiv(n, 4 * block_n), splits)](
+            x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
+            BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, TILES=4,
+            EVEN_M=m == block_m, EVEN_N=n % (4 * block_n) == 0, EVEN_K=splits * chunk == k,
+            WIDE=max(n * k, splits * m * n) + 8 * block_n * max(k, m) >= 2 ** 31,
+            num_warps=warps, num_stages=2,
+        )
     else:
         # kernels/gemm.py: each mask exists only where that axis is ragged.
         block_m = 16 if m <= 16 else 32
@@ -167,6 +177,10 @@ def _candidates(m, n, k):
         # of 8 split programs entirely masked; K=9728 takes 4.
         return (kind, block_n, block_k, exact_splits(k, block_k, gemm(block_n, block_k)[3]), 4)
 
+    def hoisted(block_n, block_k):
+        # Splits sized for programs of four tiles, then made exact.
+        return ("hoist", block_n, block_k, exact_splits(k, block_k, gemm(4 * block_n, block_k)[3]), 4)
+
     configs = [gemm(64, 128)]
     if m == 1:
         configs += [("gemv", 8, 512, 1, 4), ("gemv", 16, 256, 1, 4)]
@@ -174,7 +188,7 @@ def _candidates(m, n, k):
         # Verify blocks fill most of the 16/32 input rows, so every tile reloads
         # a large x block: wider output tiles amortize it. Judged in the real
         # verify graph (DecodeState.refine), not only in isolation.
-        configs += [tiled("exact", 64, 128), tiled("trans", 64, 128), gemm(256, 128)]
+        configs += [tiled("exact", 64, 128), tiled("trans", 64, 128), hoisted(64, 128)]
     return configs
 
 

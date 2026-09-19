@@ -6,6 +6,9 @@ split count that tiles K with whole BLOCK_K blocks (no dead split programs).
 ``trans`` computes the transposed tile product w[N', K'] @ x^T[K', M'] so the
 64-row first operand selects the wider matrix-multiply fragments. Both only
 reorder the FP32 sum over K; the single rounding to BF16 is unchanged.
+``hoist`` is ``exact`` with one x-tile load shared by TILES weight tiles: with
+16-32 input rows a program's x chunk is a quarter to a half of the bytes of a
+64-row weight tile, and every tile used to reload it. Same sums as ``exact``.
 """
 
 import triton
@@ -103,6 +106,53 @@ def _trans_gemm(
         col_ok, row_ok, EVEN_N, EVEN_M,
     )
 
+
+
+@triton.jit
+def _hoist_gemm(
+    x_ptr, weight_ptr, out_ptr,
+    M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    SPLITS: tl.constexpr, CHUNK: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_M: tl.constexpr,
+    TILES: tl.constexpr,
+    EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_K: tl.constexpr, WIDE: tl.constexpr,
+):
+    rows = tl.arange(0, BLOCK_M)
+    columns = tl.program_id(0) * (TILES * BLOCK_N) + tl.arange(0, BLOCK_N)
+    if WIDE:
+        columns = columns.to(tl.int64)
+    split = tl.program_id(1)
+    k = split * CHUNK + tl.arange(0, BLOCK_K)
+    row_ok = rows[:, None] < M
+    x_ptrs = x_ptr + rows[:, None] * K + k[None, :]
+    # Tile t covers columns + t * BLOCK_N: its weights start t * BLOCK_N rows further.
+    w_ptrs = weight_ptr + columns[None, :] * K + k[:, None]
+    w_step = BLOCK_N * K
+    ok0 = columns[None, :] < N
+    ok1 = (columns[None, :] + BLOCK_N) < N
+    acc0 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    acc1 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    if TILES == 4:
+        ok2 = (columns[None, :] + 2 * BLOCK_N) < N
+        ok3 = (columns[None, :] + 3 * BLOCK_N) < N
+        acc2 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        acc3 = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for step in range(0, CHUNK // BLOCK_K):
+        k_ok = (k + step * BLOCK_K) < K
+        x = _load_tile(x_ptrs, row_ok, k_ok[None, :], EVEN_M, EVEN_K)
+        acc0 = tl.dot(x, _load_tile(w_ptrs, k_ok[:, None], ok0, EVEN_K, EVEN_N), acc0)
+        acc1 = tl.dot(x, _load_tile(w_ptrs + w_step, k_ok[:, None], ok1, EVEN_K, EVEN_N), acc1)
+        if TILES == 4:
+            acc2 = tl.dot(x, _load_tile(w_ptrs + 2 * w_step, k_ok[:, None], ok2, EVEN_K, EVEN_N), acc2)
+            acc3 = tl.dot(x, _load_tile(w_ptrs + 3 * w_step, k_ok[:, None], ok3, EVEN_K, EVEN_N), acc3)
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+    o_ptrs = out_ptr + split * (M * N) + rows[:, None] * N + columns[None, :]
+    _store_tile(o_ptrs, acc0, row_ok, ok0, EVEN_M, EVEN_N)
+    _store_tile(o_ptrs + BLOCK_N, acc1, row_ok, ok1, EVEN_M, EVEN_N)
+    if TILES == 4:
+        _store_tile(o_ptrs + 2 * BLOCK_N, acc2, row_ok, ok2, EVEN_M, EVEN_N)
+        _store_tile(o_ptrs + 3 * BLOCK_N, acc3, row_ok, ok3, EVEN_M, EVEN_N)
 
 
 def exact_splits(k, block_k, wanted):

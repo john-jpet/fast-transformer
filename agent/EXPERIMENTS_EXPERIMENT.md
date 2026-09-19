@@ -105,3 +105,25 @@ E03 checks passed: 24 CPU consumer indexing/cast cases, 16 SM90 consumer
 specializations, 10 protocol/client tests, archive validator, both independent
 read-only reviews. Review confirms Split never reaches the ordinary final-token
 slicing path and consumers retain partial allocations through their launches.
+
+## E04 — context-robust successor drafts
+
+The competitor's measured two-context table is a separate, bounded improvement:
+their offline report gives 15.3% top-1 / 38.9% top-8 successor prediction versus
+12.9% / 34.7% for bare-token context, and 2.0–2.7% fewer passes. Their measured
+candidate44/48 stack includes it. This is reported lab evidence, not reproduced
+on this machine (which lacks the draft lab and model).
+
+Adopt the two contexts (token alone, token following newline), keep the exact
+verifier unchanged. Rank the sum of raw FP32 logits instead of computing two
+log-softmax tensors: each normalization is a row constant, so ranks are the
+same in real arithmetic. Small floating-point tie differences only affect
+draft proposals, never accepted correctness. Request logits_to_keep=1 to avoid
+computing the unused prefix-token LM head. Expected signal: TPOT at batches
+with tree alternatives. Prefill and graph architecture unchanged. Check table
+chunk boundaries and ranking equivalence with a deterministic CPU fake model.
+
+E04 checks passed: real successor_table builder tested on CPU fake model for
+eight vocabulary/chunk combinations, including partial final chunks and both
+contexts; score difference from summed log probabilities is a row constant.
+All 10 protocol/client tests and archive validation passed. No new Triton code.

@@ -20,6 +20,9 @@ other agent on origin/main. Autoresearch skill is `.claude/skills/autoresearch`.
   additional unmeasured GEMM changes. Competitor ported our E01/E02 ideas.
 - Background watch_run.py processes write agent/results/watch_baseline.log
   and watch_e01.log, plus raw final JSONs. No duplicate runs needed.
+- E03 baf1417: run 84039458-8d32-4c78-9b0e-97c6c50dea21 preparing;
+  watcher writes watch_e03.log. E04 adds two-context successor table, raw
+  logit ranking and last-only LM-head during table construction. CPU checks pass.
 
 ## E01 candidate
 

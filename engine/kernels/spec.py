@@ -157,8 +157,11 @@ def _settle(
     emitted = tl.where(branch & (slot == 1), bonus, chosen)
     tl.store(result + row * (TOKENS + 1), gained)
     tl.store(result + row * (TOKENS + 1) + 1 + slot, emitted, inside)
-    # Entries past ``gained`` are rewritten by the next pass before any read.
-    tl.store(history + row * SIZE + place + 1 + slot, emitted, inside)
+    # Only the accepted prefix can be read by the next proposal.  Rejected
+    # speculative positions were computed under a prefix that will never be
+    # committed, and the next pass rewrites them before reaching them.  Avoid
+    # the otherwise unconditional global stores for that dead suffix.
+    tl.store(history + row * SIZE + place + 1 + slot, emitted, inside & (slot < gained))
     # The kept alternative's K/V sits in its own slot; it belongs at place + 1.
     tl.store(move_from + row, tl.where(branch, place + hit, -1))
     tl.store(move_to + row, place + 1)

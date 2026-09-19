@@ -191,7 +191,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
         _skinny_gemm[(triton.cdiv(n, block_n), splits)](
             x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=_block_m(m),
-            num_warps=warps, num_stages=2,
+            num_warps=warps, num_stages=3,
         )
     elif kind == "hoist":
         # Four weight tiles per program share each x-tile load.
@@ -201,7 +201,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
             BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, TILES=4,
             EVEN_M=m == block_m, EVEN_N=n % (4 * block_n) == 0, EVEN_K=splits * chunk == k,
             WIDE=max(n * k, splits * m * n) + 8 * block_n * max(k, m) >= 2 ** 31,
-            num_warps=warps, num_stages=2,
+            num_warps=warps, num_stages=3,
         )
     elif kind == "tmah":
         # "trans" orientation, four TMA weight tiles per program sharing each x-tile load.
@@ -220,7 +220,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
                     x, desc, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
                     BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, TILES=4,
                     EVEN_M=m == block_m, WIDE=wide,
-                    num_warps=warps, num_stages=2,
+                    num_warps=warps, num_stages=3,
                 )
                 launched = True
             except Exception as error:
@@ -233,7 +233,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
                 x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
                 BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, TILES=4,
                 EVEN_M=m == block_m, EVEN_N=even_n, EVEN_K=even_k, WIDE=wide,
-                num_warps=warps, num_stages=2,
+                num_warps=warps, num_stages=3,
             )
     elif kind in ("tmap", "tmap3"):
         # Persistent launch: at most NUM_SMS programs, each walking its residue class of the
@@ -269,7 +269,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
                 x, weight, out, M=m, N=n, K=k, PROGRAMS=programs, N_TILES=tiles, STEPS=steps,
                 BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m,
                 EVEN_M=m == block_m, EVEN_N=even_n, EVEN_K=even_k, WIDE=wide,
-                num_warps=warps, num_stages=2,
+                num_warps=warps, num_stages=3,
             )
     else:
         # kernels/gemm.py: each mask exists only where that axis is ragged.
@@ -301,7 +301,7 @@ def _project(x, weight, config, split_ok=False, strict=False):
                 x, weight, partial, M=m, N=n, K=k, SPLITS=splits, CHUNK=chunk,
                 BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m,
                 EVEN_M=m == block_m, EVEN_N=n % block_n == 0, EVEN_K=splits * chunk == k, WIDE=wide,
-                num_warps=warps, num_stages=2,
+                num_warps=warps, num_stages=3,
             )
     if splits > 1 and split_ok:
         # The consumer kernel sums and rounds the partials itself.

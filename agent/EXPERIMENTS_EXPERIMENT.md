@@ -191,3 +191,15 @@ projection and BF16 rounding are unchanged. Also used for prefill.
 negative/infinite logits, final-entry maxima and ragged tails. Six SM90
 variants compiled; 10 protocol tests and archive validation passed.
 No measured speed claim; comparison base is E06.
+
+
+## E08: prioritize repeated layer traffic during refinement (held)
+
+Hypothesis: the 12-second whole-graph refinement budget currently visits the
+389M-weight LM head ahead of 36 repeated 50M-weight gate/up projections.
+Normalize the vocabulary head priority by 36, leaving every kernel and
+choice unchanged. The gated-projection knob keeps its existing priority
+just ahead of its fallback projection. This ordering also appears in the
+competitor newer unmeasured code; it is not a proven gain.
+10 tests, archive validation and diff checks passed. Hold locally while
+E06 and E07 occupy the two queued slots.

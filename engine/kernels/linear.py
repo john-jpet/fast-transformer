@@ -263,7 +263,11 @@ def linear(x, weight):
         _CHOICES[key] = _choose(flat, weight)
         # None is cuBLAS. The captured decode step re-judges these layouts.
         register(
-            ("projection",) + key[1:], rows, weight.shape[0] * weight.shape[1],
+            # The vocabulary head runs once; layer projections run 36 times.
+            # Use equivalent per-layer traffic to preserve the priority scale
+            # shared with the gated projection's separate refinement knob.
+            ("projection",) + key[1:], rows,
+            weight.numel() // (36 if weight.shape[0] == 151936 else 1),
             [config for _, config in sorted(_VALIDATED.get(key, ()), key=lambda item: item[0])],
             lambda: _CHOICES[key], lambda config: _CHOICES.__setitem__(key, config),
         )

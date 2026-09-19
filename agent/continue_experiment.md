@@ -79,3 +79,16 @@ Read baseline and E01 results, record metrics in results.tsv, keep/discard
 with new commits. Confirm no regressions in prefill, TPOT, warmup or spread.
 Explore next substantial exact-compute idea while jobs run; user encourages
 overhauls, not just block-size/pacing tweaks. origin/main last at 039a52e.
+
+
+## Latest 17:05 UTC
+
+E04 still measuring (started16:54:45). E06 b13cbd2 run
+23b323bf-c47f-4cf2-aeea-17da044f77d1 queued. E07 6c8b6aa run
+e3c3a171-8797-4fd8-9962-54ac878a9159 queued; two-stage exact argmax
+passed 60 CPU cases, 6 SM90 compilations, two independent reviews,
+standard tests and validator. Watcher watch_e07.log active.
+E08 changes only refinement priority and is HELD until queue clears.
+Leaderboard unchanged: SSS1095.135, ours1087.324. Rival6a30231
+trims tuning budgets after candidate52 exceeded900s; their argmax
+change a787855 was ported for E07. No new measured gains claimed.

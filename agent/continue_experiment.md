@@ -92,3 +92,10 @@ E08 changes only refinement priority and is HELD until queue clears.
 Leaderboard unchanged: SSS1095.135, ours1087.324. Rival6a30231
 trims tuning budgets after candidate52 exceeded900s; their argmax
 change a787855 was ported for E07. No new measured gains claimed.
+
+## Failure response, 17:15 UTC
+E04 failed incorrect_output; all public cases passed. Root cause unresolved.
+Restored bare-token table from065f18f and canceled queued E07. E06 remains
+measuring with new table and without removed merge consumers. Next pushed
+commit uses best table + Hopper + argmax + refinement priority. See latest
+EXPERIMENTS_EXPERIMENT.md section for evidence and limitations.

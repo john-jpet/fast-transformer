@@ -203,3 +203,21 @@ just ahead of its fallback projection. This ordering also appears in the
 competitor newer unmeasured code; it is not a proven gain.
 10 tests, archive validation and diff checks passed. Hold locally while
 E06 and E07 occupy the two queued slots.
+
+## E04 failure investigation and rollback
+
+Run e43aec8c-a2aa-40e0-a51d-6dc28e8405aa (1868a441) failed
+incorrect_output at 17:06 UTC. All three public cases passed correctness:
+317.162 / 530.331 / 3203.409 TPS. No ranked score. Hidden token details
+and engine logs are withheld by the service. No timeout or infrastructure error.
+The only change versus passing E03 was the two-context successor table;
+E03 itself contained the subsequently removed merge consumers. This does
+not prove the table caused incorrect output: full verification is unchanged,
+and different drafts can expose a preexisting verifier or numerical issue.
+400 CPU tree cases (959 alternative branches) passed; no reproducible
+bookkeeping bug found. Restored speculate.py exactly from best E02.
+Canceled queued E07 e3c3a171 (inherited the unvalidated table). Keep active
+E06 as evidence: it has the new table but excludes E03 consumers. New
+submission keeps Hopper, argmax and refinement ordering with the validated
+bare-token table. Protocol tests, restored builder checks and archive pass.
+This is a risk rollback, not a claim to have identified or fixed root cause.

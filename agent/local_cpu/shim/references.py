@@ -237,7 +237,8 @@ def _block_partials(
 ):
     groups_total = grid[0]
     members = TOKENS * GROUPS
-    assert grid[1] == SPLITS and BLOCK_M >= members and groups_total % KV_HEADS == 0 and SPLITS * CHUNK >= CAPACITY
+    query_tiles = grid[2] if len(grid) > 2 else 1
+    assert grid[1] == SPLITS and query_tiles == math.ceil(members / BLOCK_M) and groups_total % KV_HEADS == 0 and SPLITS * CHUNK >= CAPACITY
     batch = groups_total // KV_HEADS
     query = flat(q_ptr, batch * TOKENS * Q_HEADS * DIM).view(batch, TOKENS, KV_HEADS, GROUPS, DIM)
     key = flat(k_ptr, groups_total * CAPACITY * DIM).view(batch, KV_HEADS, CAPACITY, DIM)

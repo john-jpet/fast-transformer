@@ -179,6 +179,9 @@ def _graph_time(fn):
 
 _CONFIGS = {}
 _BLOCK_LAYOUTS = {}
+# Split query work independently from KV intervals. Each tile writes disjoint
+# query outputs/partials; no additional merge or cross-program barrier is needed.
+QUERY_TILE = 32
 _TUNING_SECONDS = 0.0  # the plain-decode layout search never found a winner; keep the default
 #: Batches above 16 decode one token per step with no speculation; a 4 s layout
 #: search there (candidate 86) went out with candidate 87 and the pair scored
@@ -266,8 +269,8 @@ def _block_partials(
 ):
     """Interval softmax for the TOKENS successive queries of one row and KV head.
 
-    Query t of row b sits at position[b] + t and sees slots up to itself. All
-    TOKENS * GROUPS queries share each loaded K/V tile; only their masks differ.
+    Query t of row b sits at position[b] + t and sees slots up to itself. Each
+    BLOCK_M-query tile shares its K/V reads; grid axis 2 partitions the queries.
     Q is token-major [B,T,Hq,D]; same BF16/FP32 arithmetic as ``_decode_partials``.
     """
     pdl_wait()  # before any global memory access
@@ -275,7 +278,7 @@ def _block_partials(
     split = tl.program_id(1)
     row = group // KV_HEADS
     kv_head = group % KV_HEADS
-    members = tl.arange(0, BLOCK_M)  # flattened (token, query head within the KV group)
+    members = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
     live = members < TOKENS * GROUPS
     token = members // GROUPS
     dims = tl.arange(0, DIM)
@@ -381,7 +384,7 @@ def _block_partials_tma(
     split = tl.program_id(1)
     row = group // KV_HEADS
     kv_head = group % KV_HEADS
-    members = tl.arange(0, BLOCK_M)  # flattened (token, query head within the KV group)
+    members = tl.program_id(2) * BLOCK_M + tl.arange(0, BLOCK_M)
     live = members < TOKENS * GROUPS
     token = members // GROUPS
     dims = tl.arange(0, DIM)
@@ -547,7 +550,9 @@ def _launch_block(kind, query, key, value, position, chain, scale, layout, maps=
     kv_heads, capacity = key.shape[1:3]
     groups = query_heads // kv_heads
     members = tokens * groups
+    block_m = min(QUERY_TILE, max(16, triton.next_power_of_2(members)))
     block_n, splits, warps = layout[:3]
+    grid = (batch * kv_heads, splits, triton.cdiv(members, block_m))
     chunk = triton.cdiv(capacity, splits)
     out = torch.empty((batch, tokens, query_heads, dim), device=query.device, dtype=query.dtype)
     if splits == 1:
@@ -558,16 +563,16 @@ def _launch_block(kind, query, key, value, position, chain, scale, layout, maps=
     constants = dict(
         TOKENS=tokens, GROUPS=groups, Q_HEADS=query_heads, KV_HEADS=kv_heads,
         DIM=dim, CAPACITY=capacity, SPLITS=splits, CHUNK=chunk, SCALE=scale,
-        BLOCK_M=max(16, triton.next_power_of_2(members)), BLOCK_N=block_n,
+        BLOCK_M=block_m, BLOCK_N=block_n,
     )
     if kind == "plain":
-        _block_partials[(batch * kv_heads, splits)](
+        _block_partials[grid](
             query, key, value, position, chain, partial, stats, out,
             PREFIX=_wide_prefix(batch, capacity), num_warps=warps, num_stages=2, **constants,
         )
     else:
         k_map, v_map, limit = maps if kind == "tma" else (key, value, capacity - batch * kv_heads * capacity % block_n)
-        _block_partials_tma[(batch * kv_heads, splits)](
+        _block_partials_tma[grid](
             query, key, value, k_map, v_map, position, chain, partial, stats, out,
             LIMIT=limit, TMA=kind == "tma", num_warps=warps, num_stages=(tuple(layout[4:]) or (2,))[0], **constants,
         )

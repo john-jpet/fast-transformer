@@ -1879,3 +1879,38 @@ alone, which is exactly what `PACE_FLOOR` discards at batch 1.
 
 So passes per token is **not** the remaining +4.9%. Pass *time* at batch 1 is
 the only lever left, and it converts 1:1 through the pacer.
+
+## 2026-09-20: two query-tiling architecture attempts (user requested two)
+
+Base: f527702, current benchmark/main. User reports leader 1230.2 vs our
+1138.7. Hypothesis, not knowledge of the leader's implementation: decouple
+query parallelism from KV splitting. The old block assigns all T*G queries to
+one CTA. At T16/G4, this is 64 queries; smaller tiles reduce live accumulators
+and increase independent CTAs without adding a reduction/launch boundary.
+Cost: repeated KV reads. Test A caps query tiles at 32, test B at 16. The third
+grid dimension partitions query members, preserving token/head offsets,
+per-query tree visibility, BF16 arithmetic, and existing split-KV reduction.
+Both ordinary and TMA attention use this layout. No warmup-budget, pacing,
+draft-policy, model-weight, or prefill change.
+
+Validation: 10 unit tests pass; archive validation and Python compilation pass.
+12 offline H100 specializations compile through cubin (tiles 16/32, splits
+1/4, prefix on/off and TMA). Dedicated Triton-interpreter suite: 60 cases pass
+against full-query layout (BF16 tolerance) and dense FP64 reference (abs 0.02),
+including ragged query counts, chain/sibling masks, empty splits, cache start
+and end, and NaN-poisoned unused capacity. Observed full-layout differences
+at most 0.001953125. The local NumPy 2 / Triton 3.1 load/store ABI was broken
+(even unchanged SwiGLU returned garbage); a test-only ctypes memory adapter
+fixes that without installing or shipping dependencies.
+
+Broader interpreter checks run too: attention and pointwise tests pass; the
+unchanged GEMM tests have rare ~0.98 BF16-ulp vs their 0.5-ulp bound, and the
+unchanged specialized T2 proposer disagrees with its older general-proposer
+oracle. TMA ordinary-twin bit-exact tests show small rounding differences in
+this CPU runtime. These are not claimed as clean suite passes. No local H100
+or checkpoint exists here, so whole-model GPU correctness and performance
+remain the remote judge's job.
+
+`dryft package` succeeded. Archive submit returned HTTP 405, as recorded in
+prior sessions; dispatch through benchmark/main's established official-run
+hook instead. Exactly two new pushes/runs are intended.

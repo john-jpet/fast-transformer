@@ -108,9 +108,12 @@ PACE_FLOOR_MIN = 0.60
 
 # Conservative first fixed-mask self-drafting experiment.  The target path
 # never consults this mask: only the speculative proposal forward passes it.
-# Keep only the first and last four blocks (about 22% retained) for the most
-# aggressive probe. The full verification pass remains unchanged.
-DRAFT_LAYER_MASK = tuple(index < 4 or index >= 32 for index in range(36))
+# Corrected 80%-retained probe: keep the stem and tail intact and omit eight
+# middle blocks. The full verification pass remains unchanged.
+DRAFT_LAYER_MASK = tuple(
+    index < 5 or index >= 31 or index not in {8, 12, 16, 20, 24, 28, 30, 6}
+    for index in range(36)
+)
 
 
 # --- DIAGNOSTIC, NOT A CANDIDATE: price one kernel boundary -------------------
@@ -266,11 +269,13 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None,
         hidden = residual
     for index, layer in enumerate(base.layers):
         if draft and not DRAFT_LAYER_MASK[index]:
-            # A skipped decoder block is an identity on its input x.  The
-            # split residual representation stores x as residual + hidden;
-            # carry that exact BF16 representation into the next block's
-            # pre-norm boundary without touching this layer's KV cache.
-            hidden, residual = residual, hidden
+            # A skipped decoder block is an identity on its input x. After the
+            # first block, the split representation is x = residual + hidden;
+            # collapse it into hidden and clear residual so the next norm's
+            # add produces exactly x. At layer zero hidden already is x.
+            if index:
+                hidden = hidden + residual
+            residual = torch.zeros_like(hidden)
             continue
         last_token_only = cache.prefilling and token_ids.shape[1] > 1 and index == len(base.layers) - 1
         if index == 0:

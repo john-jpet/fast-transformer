@@ -86,6 +86,12 @@ class PackedAttention(torch.nn.Module):
         return linear(attention.reshape(*output_shape, -1).contiguous(), self.o_proj.weight, split_ok=split), None
 
 
+#: Prefill MLP row-block. 1024 rows keep the gate/up tile at 39.8 MB, inside a
+#: 50 MB L2; 2048 would be 79.7 MB and miss it, 512 doubles the launches for no
+#: further benefit. Decode never reaches it -- a verify block is at most 64 rows.
+PREFILL_CHUNK = 1024
+
+
 class PackedMLP(torch.nn.Module):
     def __init__(self, reference):
         super().__init__()
@@ -98,5 +104,31 @@ class PackedMLP(torch.nn.Module):
 
     def forward(self, hidden_states, split_ok=False):
         rows = hidden_states.numel() // hidden_states.shape[-1]
+        if not split_ok and rows > PREFILL_CHUNK:
+            return self.chunked(hidden_states, rows)
         gate_up = linear(hidden_states, self.gate_up_weight, split_ok=split_ok)
         return linear(swiglu(gate_up), self.down_proj.weight, split_ok=split_ok)
+
+    def chunked(self, hidden_states, rows):
+        """The prefill MLP a row-block at a time, so the gate/up tile stays in L2.
+
+        At a 2048-token prompt the gate/up output is [8192, 19456] BF16, 318.8
+        MB: cuBLAS writes it to HBM and ``swiglu`` reads every byte straight
+        back, because nothing that large lives in a 50 MB L2. A 1024-row block
+        makes it 39.8 MB, which does, so the write is absorbed and the read
+        never leaves the cache -- about 23 GB across the 36 layers, near 6.8 ms
+        of bus time. Eight blocks a layer cost 21 extra launches at ~1.1 us, so
+        the trade nets about +6 ms of a 120 ms prefill.
+
+        Rows of a GEMM are independent and SwiGLU is elementwise, so every value
+        is the one the single call produced. The block count is fixed by the
+        prompt shape, so the captured graph stays static.
+        """
+        width = hidden_states.shape[-1]
+        flat = hidden_states.reshape(rows, width)
+        out = torch.empty((rows, width), dtype=hidden_states.dtype, device=hidden_states.device)
+        for start in range(0, rows, PREFILL_CHUNK):
+            block = flat[start:start + PREFILL_CHUNK]
+            gate_up = linear(block, self.gate_up_weight)
+            out[start:start + PREFILL_CHUNK] = linear(swiglu(gate_up), self.down_proj.weight)
+        return out.reshape(hidden_states.shape)

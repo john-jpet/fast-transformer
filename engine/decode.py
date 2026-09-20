@@ -5,6 +5,7 @@ decode attention reads the valid prefix using a GPU position. Weights and KV
 storage remain BF16; fused pointwise operations preserve native cast boundaries.
 """
 
+import os
 import time
 
 import torch
@@ -95,6 +96,7 @@ PACE_MEDIAN = 0.88
 #: floor (offline: 0.66 at 2048 tokens, batch one). Never above PACE_FLOOR.
 WORST_PASSES = 0.90
 PACE_FLOOR_MIN = 0.60
+SUPERGRAPH_DEPTH = max(1, int(os.environ.get("FASTY_SUPERGRAPH_DEPTH", "2")))
 
 
 class Mailbox:
@@ -394,7 +396,10 @@ class DecodeState:
         # alternatives stand where draft 1 stands; KV slots are position + t),
         # the pass result and its pinned host mirror.
         self.phases = torch.zeros((batch, tokens), dtype=torch.int64, device=self.device)
-        self.result = torch.zeros((batch, tokens + 1), dtype=torch.int64, device=self.device)
+        self.result_slots = torch.zeros(
+            (SUPERGRAPH_DEPTH, batch, tokens + 1), dtype=torch.int64, device=self.device
+        )
+        self.result = self.result_slots[0]
         try:
             self.host_passes = torch.empty((output_length, batch, tokens + 1), dtype=torch.int64, pin_memory=True)
         except RuntimeError:
@@ -425,8 +430,10 @@ class DecodeState:
         add_rms_norm(hidden, hidden, layer.input_layernorm.weight, layer.input_layernorm.variance_epsilon)
         swiglu(weight.new_zeros((batch, tokens, layer.mlp.gate_up_weight.shape[0])))
 
-    def speculate(self):
+    def speculate(self, result=None):
         """One verify pass: result[b] = (tokens gained, greedy tokens), all on the GPU."""
+        if result is None:
+            result = self.result
         tokens = spec.propose(
             self.history, self.row_position, self.block_size, self.drafts_by_match,
             self.model.successor, self.stale, self.chains, self.phases,
@@ -441,7 +448,7 @@ class DecodeState:
         # Keep what the model itself chose (chain drafts, or one alternative),
         # never past the last requested token; record it; move each row.
         spec.settle(
-            tokens, greedy, self.row_position, self.limit, self.history, self.result,
+            tokens, greedy, self.row_position, self.limit, self.history, result,
             self.move_from, self.move_to, self.chains, self.stale,
         )
         if min(self.drafts_by_match) < self.block_size - 1:
@@ -454,13 +461,15 @@ class DecodeState:
         with torch.cuda.stream(stream):
             for _ in range(eager):
                 self.row_position.fill_(self.shape[1])
-                self.speculate()
+                for slot in range(SUPERGRAPH_DEPTH):
+                    self.speculate(self.result_slots[slot])
         current.wait_stream(stream)
         torch.cuda.synchronize(self.device)
         self.row_position.fill_(self.shape[1])
         self.spec_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.spec_graph, stream=stream):
-            self.speculate()
+            for slot in range(SUPERGRAPH_DEPTH):
+                self.speculate(self.result_slots[slot])
         current.wait_stream(stream)
         # The pass time sets the release pace that bounds sample-to-sample
         # spread. Passes run back to back in a generation, so they are timed
@@ -484,7 +493,7 @@ class DecodeState:
         # pass itself, not by a clock still ramping or a neighbour's traffic
         # (on the platform the floor-set batch-1 TPOT varied 2.86-3.39 ms for
         # the same kernels between runs).
-        self.pass_seconds = min(times) / 1000.0
+        self.pass_seconds = min(times) / 1000.0 / SUPERGRAPH_DEPTH
         self.pace_seconds = self.pace_floor() * self.pass_seconds
 
     def pace_floor(self):
@@ -585,10 +594,14 @@ class DecodeState:
             if flying >= self.lookahead or known + flying >= self.shape[2]:
                 return
             self.spec_graph.replay()
-            self.host_passes[self.passes_enqueued].copy_(self.result, non_blocking=True)
-            self.pass_mailbox.post(self.passes_enqueued)
-            self.pass_events[self.passes_enqueued].record()
-            self.passes_enqueued += 1
+            count = min(SUPERGRAPH_DEPTH, self.shape[2] - self.passes_enqueued)
+            for slot in range(count):
+                self.host_passes[self.passes_enqueued].copy_(
+                    self.result_slots[slot], non_blocking=True
+                )
+                self.pass_mailbox.post(self.passes_enqueued)
+                self.pass_events[self.passes_enqueued].record()
+                self.passes_enqueued += 1
 
     def read_speculative(self, step):
         if step == 0:

@@ -1958,3 +1958,9 @@ This removes the FP32 partial tensors and `_block_merge` launch from every
 verify pass. The arithmetic remains dense and exact; only the interval
 partition changes. The target signal is public-0 TPOT for batch 1 and public-2
 TPOT for long output, where merge overhead repeats most often.
+
+Radical follow-up: make the default wide-prefix verify layout Hopper TMA with
+three in-flight K/V tiles. The existing tensor-map kernel and numerical probe
+were present but only offered as a late tuning option; this experiment makes
+the asynchronous memory path the incumbent for long prefixes and lets the
+probe fall back to ordinary loads if descriptors or arithmetic do not certify.

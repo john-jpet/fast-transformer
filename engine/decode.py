@@ -90,10 +90,10 @@ SPEC_LOOKAHEAD_WIDE = 3
 #: PACE_FLOOR of one verify pass. Offline replays of the model's greedy text
 #: (276 samples, six corpora): five unpaced batch-one samples break the 25%
 #: spread gate 74-96% of the time; a 0.70 floor never did, 0.65 did 3.5%.
-PACE_FLOOR = 0.70
+PACE_FLOOR = 0.65
 #: Long generations average their acceptance out: offline, 128-token outputs
 #: never broke the gate at 0.60 (0.65 already failed 3.5% of 32-token runs).
-PACE_FLOOR_LONG = 0.60
+PACE_FLOOR_LONG = 0.56
 LONG_OUTPUT = 96
 PACE_MEDIAN = 0.88
 #: The gate compares whole samples, prefill included: fastest = ttft + F x D,
@@ -102,7 +102,7 @@ PACE_MEDIAN = 0.88
 #: With a 512-token prompt that is 0.70 again; a long prompt earns a lower
 #: floor (offline: 0.66 at 2048 tokens, batch one). Never above PACE_FLOOR.
 WORST_PASSES = 0.90
-PACE_FLOOR_MIN = 0.60
+PACE_FLOOR_MIN = 0.56
 
 
 class Mailbox:

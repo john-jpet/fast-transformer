@@ -1946,3 +1946,9 @@ Third probe: retain only the first and last four blocks (22% retained) in the
 draft path. This is intentionally beyond a plausible production setting and
 measures the shallowest stem/head draft that still preserves the exact full
 model verification path.
+
+Autoresearch correction: the block-skipped path was removed from the verifier
+after the platform rejected it. This candidate keeps the exact full target
+forward and retains only the independent query-tiling kernel change, which
+reduces CTA accumulator size and increases query parallelism without changing
+the verification formula.

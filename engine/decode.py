@@ -490,9 +490,12 @@ class DecodeState:
         # Whole tables; the QK-RoPE kernel reads row b's token t at
         # row_position[b] + phases[b, t] (three host launches fewer per pass).
         rope = (self.cos[0], self.sin[0], self.phases)
+        # Verification always uses the complete target model. The experimental
+        # layer-skipped draft path is disabled here because it cannot certify
+        # greedy tokens; query-tiled attention remains the measured speed path.
         logits = forward_last(
             self.model, tokens, self.cache, self.row_position, rope, every=True,
-            draft=True,
+            draft=False,
         )
         greedy = logits  # forward_last(every=True) already reduced them
         # Keep what the model itself chose (chain drafts, or one alternative),

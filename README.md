@@ -1,6 +1,6 @@
 # Fast Transformer
 
-Developed as part of the Hack the North Dryft Challenge. Achieved 6th place out of 50+ teams with an output of 1152.3 tok/s!
+Developed as part of Dryft's Hack the North Challenge. Achieved 6th place out of 50+ teams with an output of 1152.3 tok/s!
 <img width="1476" height="802" alt="image" src="https://github.com/user-attachments/assets/1db6f8b3-0a40-449b-9e20-f8cea8c6daa8" />
 
 # About Dryft's Hack the North Challenge (from the [devpost](https://hackthenorth2026.devpost.com/)):

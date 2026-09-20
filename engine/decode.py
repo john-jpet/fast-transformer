@@ -1,5 +1,14 @@
 """Native Qwen layers with graph-stable decode storage.
 
+DIAGNOSTIC MARKER (candidate 109): this docstring is the only difference
+between this tree and the 1144.3 base. It changes the archive, and so the
+source hash every Triton kernel is keyed by, while leaving every generated PTX
+and every launch identical. If the score lands at the base's 1143.7 then the
+~2% that nine substantive changes all paid is caused by what they compiled to.
+If it lands near 1122 with the rest of them, the cost is attached to the commit
+rather than to the code, and every candidate so far has been measured against a
+bar that no edited tree can reach.
+
 Prefill exposes only the freshly written prompt to causal SDPA. Dense Triton
 decode attention reads the valid prefix using a GPU position. Weights and KV
 storage remain BF16; fused pointwise operations preserve native cast boundaries.

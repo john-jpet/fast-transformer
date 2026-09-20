@@ -106,6 +106,14 @@ PACE_MEDIAN = 0.88
 WORST_PASSES = 0.90
 PACE_FLOOR_MIN = 0.60
 
+# Conservative first fixed-mask self-drafting experiment.  The target path
+# never consults this mask: only the speculative proposal forward passes it.
+# Keep the stem and tail intact and omit eight middle blocks (80% retained).
+DRAFT_LAYER_MASK = tuple(
+    index < 5 or index >= 31 or index not in {8, 12, 16, 20, 24, 28, 30, 6}
+    for index in range(36)
+)
+
 
 # --- DIAGNOSTIC, NOT A CANDIDATE: price one kernel boundary -------------------
 # NVIDIA's r560 microbenchmark puts device-side graph replay at 0.53-0.70 us a
@@ -242,7 +250,8 @@ class KVCache:
         return k_cache, v_cache
 
 
-def forward_last(model, token_ids, cache, position, rope, attention_mask=None, every=False):
+def forward_last(model, token_ids, cache, position, rope, attention_mask=None,
+                 every=False, draft=False):
     """Full unpadded prefill, one decode token, or a verify block.
 
     Return the last token's logits [B,V], or with ``every`` all of them [B,T,V].
@@ -258,6 +267,13 @@ def forward_last(model, token_ids, cache, position, rope, attention_mask=None, e
         normalized, residual = embed_rms_norm(token_ids, base.embed_tokens.weight, first.weight, first.variance_epsilon)
         hidden = residual
     for index, layer in enumerate(base.layers):
+        if draft and not DRAFT_LAYER_MASK[index]:
+            # A skipped decoder block is an identity on its input x.  The
+            # split residual representation stores x as residual + hidden;
+            # carry that exact BF16 representation into the next block's
+            # pre-norm boundary without touching this layer's KV cache.
+            hidden, residual = residual, hidden
+            continue
         last_token_only = cache.prefilling and token_ids.shape[1] > 1 and index == len(base.layers) - 1
         if index == 0:
             if cache.prefilling:
@@ -472,7 +488,8 @@ class DecodeState:
         # row_position[b] + phases[b, t] (three host launches fewer per pass).
         rope = (self.cos[0], self.sin[0], self.phases)
         logits = forward_last(
-            self.model, tokens, self.cache, self.row_position, rope, every=True
+            self.model, tokens, self.cache, self.row_position, rope, every=True,
+            draft=True,
         )
         greedy = logits  # forward_last(every=True) already reduced them
         # Keep what the model itself chose (chain drafts, or one alternative),

@@ -1929,3 +1929,15 @@ Confirmed by Dryft API: A (32-query) run fd1df581-d60c-4836-b0f5-a08d4ff5934d,
 dispatch e60d83d; B (16-query) run 08641c86-51c3-4e6c-90e6-14c28998a8de,
 dispatch b74baea, source 1935754. Both official and queued behind the existing
 diagnostic at 2026-09-20 01:02 UTC. No scores yet. Exactly two new runs created.
+## Mega-kernel stress tests — 2026-09-20
+
+The competition gap is now large enough to justify deliberately risky
+architectural probes. The worktree contains a speculative draft-only decoder
+that omits eight middle transformer blocks while retaining the first five and
+last five. This is not an approximation in the emitted verification path: it
+is a test of whether draft computation can be made radically cheaper before
+the full model accepts tokens. The exact full model still owns acceptance.
+Two variants are being dispatched: 80% of blocks retained, then 50% retained.
+Expected outcome is either a large speedup or an incorrect-output rejection;
+the result distinguishes whether the platform's quality gate permits this
+class of exact-verification architecture.

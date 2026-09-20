@@ -1,6 +1,7 @@
 """BF16 Qwen3 with a reusable KV cache and one CUDA graph per decode shape."""
 
 import gc
+import os
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -12,6 +13,21 @@ from speculate import successor_table
 #: Decode steps enqueued beyond the one being read. Bounded, so an abandoned
 #: generator leaves little work behind and the launch queue stays shallow.
 LOOKAHEAD = 4
+PROFILE = os.environ.get("FASTY_PROFILE", "") == "1"
+
+
+def _nvtx(name):
+    if PROFILE and torch.cuda.is_available():
+        return torch.cuda.nvtx.range(name)
+    return _NullRange()
+
+
+class _NullRange:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
 
 
 class Engine:
@@ -76,16 +92,19 @@ class Engine:
             with torch.inference_mode():
                 state = self.state
                 prompt = torch.tensor(input_ids, dtype=torch.int64, device=state.device)
-                state.prefill(prompt)
+                with _nvtx("SPEC_ITERATION/PREFILL"):
+                    state.prefill(prompt)
                 # Keep a few decode steps queued behind the GPU so it never waits
                 # for the consumer; never enqueue past the requested output count.
-                state.advance(min(max_new_tokens, 1 + LOOKAHEAD))
-                tokens = state.read(0)
+                with _nvtx("SPEC_ITERATION/DRAFT_VERIFY_ACCEPT"):
+                    state.advance(min(max_new_tokens, 1 + LOOKAHEAD))
+                    tokens = state.read(0)
             yield tokens
             for step in range(1, max_new_tokens):
                 with torch.inference_mode():
-                    state.advance(min(max_new_tokens, step + 1 + LOOKAHEAD))
-                    tokens = state.read(step)
+                    with _nvtx("SPEC_ITERATION/DRAFT_VERIFY_ACCEPT"):
+                        state.advance(min(max_new_tokens, step + 1 + LOOKAHEAD))
+                        tokens = state.read(step)
                 yield tokens
         finally:
             if collecting:

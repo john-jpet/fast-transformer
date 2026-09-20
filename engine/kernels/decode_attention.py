@@ -181,7 +181,7 @@ _CONFIGS = {}
 _BLOCK_LAYOUTS = {}
 # Split query work independently from KV intervals. Each tile writes disjoint
 # query outputs/partials; no additional merge or cross-program barrier is needed.
-QUERY_TILE = 32
+QUERY_TILE = 16
 _TUNING_SECONDS = 0.0  # the plain-decode layout search never found a winner; keep the default
 #: Batches above 16 decode one token per step with no speculation; a 4 s layout
 #: search there (candidate 86) went out with candidate 87 and the pair scored

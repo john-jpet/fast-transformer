@@ -1914,3 +1914,13 @@ remain the remote judge's job.
 `dryft package` succeeded. Archive submit returned HTTP 405, as recorded in
 prior sessions; dispatch through benchmark/main's established official-run
 hook instead. Exactly two new pushes/runs are intended.
+
+Attempt A dispatched as e60d83d867496e07ed34ed06aba038c4e8811f5b
+(source 82007a3). Remote main had advanced to the independent diagnostic
+f0924d5 while testing; the dispatch merge preserves its history and uses the
+already-tested f527702-based experimental tree. Its diagnostic run was not
+canceled or otherwise changed.
+
+Attempt B: same experimental tree with QUERY_TILE=16. Both tile sizes were
+covered by the numerical and offline compilation tests above. This isolates
+the register-pressure / KV-read tradeoff from other engine changes.

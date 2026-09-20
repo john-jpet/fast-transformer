@@ -36,5 +36,5 @@ def swiglu(packed):
             packed, output, WIDTH=width, BLOCK=1024, COUNT=count, SPLITS=splits, num_warps=warps,
         )
 
-    launch(pick(("swiglu", rows, width), 4, (1, 2, 8), launch) if rows <= 16 else 4)
+    launch(pick(("swiglu", rows, width), 4, (1, 2, 8), launch) if rows <= 64 else 4)
     return output

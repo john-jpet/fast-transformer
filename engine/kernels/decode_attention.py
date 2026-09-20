@@ -180,9 +180,11 @@ def _graph_time(fn):
 _CONFIGS = {}
 _BLOCK_LAYOUTS = {}
 _TUNING_SECONDS = 0.0  # the plain-decode layout search never found a winner; keep the default
-#: Batches above 16 decode one token per step with no speculation, and at long
-#: context the K/V read is most of that step: those shapes get a real search.
-_WIDE_TUNING_SECONDS = 4.0
+#: Batches above 16 decode one token per step with no speculation; a 4 s layout
+#: search there (candidate 86) went out with candidate 87 and the pair scored
+#: 1.6% below its parent, so the search is off again and candidate 87 (the
+#: pacing measurement) stands alone. Re-test it by itself if a slot is free.
+_WIDE_TUNING_SECONDS = 0.0
 
 
 def _choose(query, key, value, position, scale):

@@ -57,9 +57,17 @@ def block_candidates(batch):
     within 64 rows (public-2 ran 2% faster with four tokens per row through 64
     cuBLAS rows than with two, while the hidden aggregate fell when that was
     forced for every short prompt: so it is measured per workload instead).
+
+    Above 16 rows this used to return nothing, which left any workload of more
+    than 16 sequences decoding one token per pass while every smaller shape got
+    1.3 to 1.8. The verify block there is two tokens a row, so 32 sequences run
+    64 rows -- still an eighth of the 295-row roofline ridge, so the weights are
+    read once per pass exactly as they are at 32 rows, and `linear` already
+    sends more than MAX_ROWS to cuBLAS, so no new Triton GEMM shape is compiled
+    (that, not the arithmetic, is what put candidate 68 over the time limit).
+    The pass costs about what it cost before and returns about 1.28 tokens
+    instead of 1.
     """
-    if batch > 16:
-        return []
     sizes = []
     for rows in ((16, 32) if batch <= 8 else (32, 64)):
         fitting = [size for size in DRAFTS_BY_MATCH if size * batch <= max(rows, 2 * batch)]
@@ -70,6 +78,10 @@ def block_candidates(batch):
 
 #: Verify passes queued behind the GPU.
 SPEC_LOOKAHEAD = 2
+#: Batches above two are never held back by the release pace (offline: the
+#: floor binds only at batch 1-2), so there the queue exists purely to keep the
+#: GPU from waiting on the host between passes: one more in flight.
+SPEC_LOOKAHEAD_WIDE = 3
 #: Release pacing. The score is the median sample, and the spread gate compares
 #: the fastest and slowest of five, so holding a fast sample back costs nothing
 #: as long as it stays below the median. Tokens are released no faster than
@@ -349,6 +361,7 @@ class DecodeState:
             self.host_tokens = torch.empty((output_length, batch), dtype=torch.int64, pin_memory=True)
         except RuntimeError:
             self.host_tokens = torch.empty((output_length, batch), dtype=torch.int64)
+        self.step_tokens = self.host_tokens.numpy()
         self.events = [torch.cuda.Event() for _ in range(output_length)]
         self.mailbox = Mailbox(output_length, self.device)
         self.enqueued = 0
@@ -394,6 +407,10 @@ class DecodeState:
             self.host_passes = torch.empty((output_length, batch, tokens + 1), dtype=torch.int64, pin_memory=True)
         except RuntimeError:
             self.host_passes = torch.empty((output_length, batch, tokens + 1), dtype=torch.int64)
+        # A view, made once: per-pass reads then cost a memory access, not a
+        # torch call that allocates Python lists for every row.
+        self.pass_rows = self.host_passes.numpy()
+        self.lookahead = SPEC_LOOKAHEAD if batch <= 2 else SPEC_LOOKAHEAD_WIDE
         self.tokens, self.passes_enqueued, self.passes_read = [], 0, 0
         self.started, self.pace_seconds, self.pass_seconds = 0.0, 0.0, 0.0
         # Unpaced seconds per token of earlier generations in this process.
@@ -559,10 +576,10 @@ class DecodeState:
                 wait = False
             elif not (self.pass_mailbox.ready(self.passes_read) or (not self.pass_mailbox.usable and event.query())):
                 return
-            rows = self.host_passes[self.passes_read].tolist()
+            rows = self.pass_rows[self.passes_read]
             self.passes_read += 1
             for known, row in zip(self.tokens, rows):
-                known.extend(row[1:1 + row[0]])
+                known.extend(row[1:1 + row[0]].tolist())
             if self.finished is None and min(map(len, self.tokens)) >= self.shape[2]:
                 self.finished = time.perf_counter()
 
@@ -573,7 +590,7 @@ class DecodeState:
             flying = self.passes_enqueued - self.passes_read
             known = min(map(len, self.tokens)) if self.tokens else 1
             # Every pass in flight gives the slowest unfinished row a token.
-            if flying >= SPEC_LOOKAHEAD or known + flying >= self.shape[2]:
+            if flying >= self.lookahead or known + flying >= self.shape[2]:
                 return
             self.spec_graph.replay()
             self.host_passes[self.passes_enqueued].copy_(self.result, non_blocking=True)
@@ -584,7 +601,7 @@ class DecodeState:
     def read_speculative(self, step):
         if step == 0:
             self.mailbox.wait(0, self.events[0])
-            self.tokens = [[token] for token in self.host_tokens[0].tolist()]
+            self.tokens = [[token] for token in self.step_tokens[0].tolist()]
             self.fill()
             self.started = time.perf_counter()
             return [known[0] for known in self.tokens]
@@ -706,7 +723,7 @@ class DecodeState:
         if self.speculative:
             return self.read_speculative(step)
         self.mailbox.wait(step, self.events[step])
-        return self.host_tokens[step].tolist()
+        return self.step_tokens[step].tolist()
 
     def prefill(self, prompt):
         # Steps left in flight by an abandoned generator precede this prefill

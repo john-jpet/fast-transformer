@@ -118,7 +118,9 @@ def add_rms_norm(x, residual, weight, eps):
         )
 
     # Decode rows are launch-bound: measure the block width once per shape.
-    warps = pick(("add_rms_norm", rows, width), 4, (1, 2, 8), launch) if rows <= 16 else 4
+    # Verify blocks run 16-64 rows; every width is the same kernel writing the
+    # same values, and the captured pass judges the choice.
+    warps = pick(("add_rms_norm", rows, width), 4, (1, 2, 8), launch) if rows <= 64 else 4
     launch(warps)
     return out.reshape(shape), summed.reshape(shape)
 
@@ -149,8 +151,12 @@ def embed_rms_norm(token_ids, table, weight, eps):
         raise ValueError("embedding rows must fit one block and the table must be contiguous")
     hidden = torch.empty((ids.numel(), n_cols), dtype=table.dtype, device=table.device)
     out = torch.empty_like(hidden)
-    _embed_rms_norm_kernel[(ids.numel(),)](
-        ids, table, weight, out, hidden, n_cols, eps, BLOCK=block, num_warps=4 if block <= 4096 else 8,
-    )
+
+    def launch(warps):
+        _embed_rms_norm_kernel[(ids.numel(),)](
+            ids, table, weight, out, hidden, n_cols, eps, BLOCK=block, num_warps=warps,
+        )
+
+    launch(pick(("embed_rms_norm", ids.numel(), n_cols), 4 if block <= 4096 else 8, (2, 8), launch))
     shape = (*token_ids.shape, n_cols)
     return out.reshape(shape), hidden.reshape(shape)

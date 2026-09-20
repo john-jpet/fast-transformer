@@ -1924,3 +1924,8 @@ canceled or otherwise changed.
 Attempt B: same experimental tree with QUERY_TILE=16. Both tile sizes were
 covered by the numerical and offline compilation tests above. This isolates
 the register-pressure / KV-read tradeoff from other engine changes.
+
+Confirmed by Dryft API: A (32-query) run fd1df581-d60c-4836-b0f5-a08d4ff5934d,
+dispatch e60d83d; B (16-query) run 08641c86-51c3-4e6c-90e6-14c28998a8de,
+dispatch b74baea, source 1935754. Both official and queued behind the existing
+diagnostic at 2026-09-20 01:02 UTC. No scores yet. Exactly two new runs created.

@@ -14,6 +14,21 @@ from kernels.pdl import wait as pdl_wait
 
 
 @triton.jit
+def _propose_pair(history, position, successor, tokens, chains, phases, SIZE: tl.constexpr, TOP: tl.constexpr):
+    """Two-token verifier proposal without the generic history/sibling search."""
+    pdl_wait()
+    row = tl.program_id(0).to(tl.int64)
+    place = tl.load(position + row)
+    trusted = tl.load(history + row * SIZE + place)
+    draft = tl.load(successor + trusted * TOP)
+    tl.store(tokens + row * 2, trusted)
+    tl.store(tokens + row * 2 + 1, draft)
+    tl.store(chains + row, 2)
+    tl.store(phases + row * 2, 0)
+    tl.store(phases + row * 2 + 1, 1)
+
+
+@triton.jit
 def _propose(
     history, position, successor, stale, tokens, chains, phases,
     SIZE: tl.constexpr, TOKENS: tl.constexpr, MAXLEN: tl.constexpr,
@@ -113,6 +128,12 @@ def propose(history, position, tokens_per_row, drafts_by_match, successor, stale
     assert len(drafts_by_match) == 4 and all(1 <= d <= tokens_per_row - 1 for d in drafts_by_match)
     lanes = tokens_per_row - 1 - min(drafts_by_match)
     tokens = torch.empty((batch, tokens_per_row), dtype=torch.int64, device=history.device)
+    if tokens_per_row == 2 and tuple(drafts_by_match) == (1, 1, 1, 1):
+        _propose_pair[(batch,)](
+            history, position, successor, tokens, chains, phases,
+            SIZE=size, TOP=successor.shape[1], num_warps=1,
+        )
+        return tokens
     _propose[(batch,)](
         history, position, successor, stale, tokens, chains, phases,
         SIZE=size, TOKENS=tokens_per_row, MAXLEN=8,

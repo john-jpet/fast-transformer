@@ -1952,3 +1952,9 @@ after the platform rejected it. This candidate keeps the exact full target
 forward and retains only the independent query-tiling kernel change, which
 reduces CTA accumulator size and increases query parallelism without changing
 the verification formula.
+
+Next auto-research hypothesis: force one split for speculative block attention.
+This removes the FP32 partial tensors and `_block_merge` launch from every
+verify pass. The arithmetic remains dense and exact; only the interval
+partition changes. The target signal is public-0 TPOT for batch 1 and public-2
+TPOT for long output, where merge overhead repeats most often.

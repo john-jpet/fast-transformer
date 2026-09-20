@@ -654,7 +654,13 @@ def block_attention(query, key, value, position, scale, chain):
     if shape not in _BLOCK_LAYOUTS:
         # Start from the decode default; the captured verify graph re-judges
         # the alternatives (same dense attention, different interval tiling).
-        default = _default_config(batch, kv_heads, capacity)
+        base = _default_config(batch, kv_heads, capacity)
+        default = (base[0], base[1], base[2])
+        if _wide_prefix(batch, capacity) and _tma_attention_offered(key):
+            # Make the certified three-stage Hopper TMA path the incumbent.
+            # _tma_block fails closed to ordinary loads if descriptors are not
+            # available or the eager numerical probe rejects this layout.
+            default = (*default, TMA, 3)
         options = [default]
         for block_n, splits in ((64, 1), (128, 1), (128, default[1] // 2), (64, default[1] * 2), (128, default[1])):
             option = (block_n, max(1, min(32, splits, triton.cdiv(capacity, block_n))), 4)
@@ -663,7 +669,8 @@ def block_attention(query, key, value, position, scale, chain):
         if _wide_prefix(batch, capacity) and _tma_attention_offered(key):
             # Last, never the default: tensor-map reads of the prefix tiles must win a timing.
             # Pipeline depth 2 issues the next K/V copy behind this tile's dots; 3 keeps one more tile in flight.
-            options += [default + (TMA, 2), default + (TMA, 3)]
+            tma_base = default[:3]
+            options += [tma_base + (TMA, 2), tma_base + (TMA, 3)]
         _BLOCK_LAYOUTS[shape] = default
         if not torch.cuda.is_current_stream_capturing():
             # Refined first, as in the best measured engine (candidate 57): the

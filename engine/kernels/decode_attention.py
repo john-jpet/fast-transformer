@@ -654,7 +654,7 @@ def block_attention(query, key, value, position, scale, chain):
     if shape not in _BLOCK_LAYOUTS:
         # Start from the decode default; the captured verify graph re-judges
         # the alternatives (same dense attention, different interval tiling).
-        default = _default_config(batch, kv_heads, capacity)
+        default = (128, 1, 4)
         options = [default]
         for block_n, splits in ((64, 1), (128, 1), (128, default[1] // 2), (64, default[1] * 2), (128, default[1])):
             option = (block_n, max(1, min(32, splits, triton.cdiv(capacity, block_n))), 4)

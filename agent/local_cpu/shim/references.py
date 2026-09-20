@@ -118,16 +118,16 @@ def _fused_block_argmax(grid, x_ptr, weight_ptr, best_value, best_index, M, N, K
 
 
 @reference("_embed_rms_norm_kernel")
-def _embed_rms_norm_kernel(grid, ids_ptr, table_ptr, w_ptr, y_ptr, h_ptr, n_cols, eps, BLOCK, **launch):
+def _embed_rms_norm_kernel(grid, ids_ptr, table_ptr, w_ptr, y_ptr, h_ptr, WIDTH, eps, BLOCK, **launch):
     rows = grid[0]
     ids = flat(ids_ptr, rows).to(torch.int64)
-    table = flat(table_ptr, (int(ids.max()) + 1) * n_cols).view(-1, n_cols)
+    table = flat(table_ptr, (int(ids.max()) + 1) * WIDTH).view(-1, WIDTH)
     raw = table[ids]
-    flat(h_ptr, rows * n_cols).view(rows, n_cols).copy_(raw)
+    flat(h_ptr, rows * WIDTH).view(rows, WIDTH).copy_(raw)
     x = raw.to(F32)
     normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
-    weight = flat(w_ptr, n_cols)
-    flat(y_ptr, rows * n_cols).view(rows, n_cols).copy_(normed.to(BF16) * weight)
+    weight = flat(w_ptr, WIDTH)
+    flat(y_ptr, rows * WIDTH).view(rows, WIDTH).copy_(normed.to(BF16) * weight)
 
 
 @reference("_swiglu")

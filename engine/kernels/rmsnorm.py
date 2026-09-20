@@ -126,20 +126,28 @@ def add_rms_norm(x, residual, weight, eps):
 
 
 @triton.jit
-def _embed_rms_norm_kernel(ids_ptr, table_ptr, w_ptr, y_ptr, h_ptr, n_cols, eps, BLOCK: tl.constexpr):
-    """Row = the embedding of ids[row], copied out as the residual stream and normalized like _rms_norm_kernel."""
+def _embed_rms_norm_kernel(ids_ptr, table_ptr, w_ptr, y_ptr, h_ptr, WIDTH: tl.constexpr, eps, BLOCK: tl.constexpr):
+    """Row = the embedding of ids[row], copied out as the residual stream and normalized like _rms_norm_kernel.
+
+    ``WIDTH`` is a constant, not a runtime argument. The row width is fixed by
+    the model, and as an argument it left every address in here unprovable, so
+    the row was read and written one 16-bit element at a time; as a constant
+    the same body compiles to word-sized accesses. Nothing about the values
+    changes: the same elements are summed in the same order and the divide is
+    by the same number.
+    """
     pdl_wait()  # before any global memory access
     row = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK)
-    mask = cols < n_cols
+    mask = cols < WIDTH
     token = tl.load(ids_ptr + row).to(tl.int64)
-    raw = tl.load(table_ptr + token * n_cols + cols, mask=mask, other=0.0)
-    tl.store(h_ptr + row * n_cols + cols, raw, mask=mask)
+    raw = tl.load(table_ptr + token * WIDTH + cols, mask=mask, other=0.0)
+    tl.store(h_ptr + row * WIDTH + cols, raw, mask=mask)
     x = raw.to(tl.float32)
-    variance = tl.sum(x * x, axis=0) / n_cols
+    variance = tl.sum(x * x, axis=0) / WIDTH
     normed = x * tl.math.rsqrt(variance + eps)
     weight = tl.load(w_ptr + cols, mask=mask, other=0.0)
-    tl.store(y_ptr + row * n_cols + cols, normed.to(y_ptr.dtype.element_ty) * weight, mask=mask)
+    tl.store(y_ptr + row * WIDTH + cols, normed.to(y_ptr.dtype.element_ty) * weight, mask=mask)
 
 
 def embed_rms_norm(token_ids, table, weight, eps):
@@ -154,7 +162,7 @@ def embed_rms_norm(token_ids, table, weight, eps):
 
     def launch(warps):
         _embed_rms_norm_kernel[(ids.numel(),)](
-            ids, table, weight, out, hidden, n_cols, eps, BLOCK=block, num_warps=warps,
+            ids, table, weight, out, hidden, WIDTH=n_cols, eps=eps, BLOCK=block, num_warps=warps,
         )
 
     launch(pick(("embed_rms_norm", ids.numel(), n_cols), 4 if block <= 4096 else 8, (2, 8), launch))

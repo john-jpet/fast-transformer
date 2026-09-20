@@ -8,6 +8,8 @@ storage remain BF16; fused pointwise operations preserve native cast boundaries.
 import time
 
 import torch
+import triton
+import triton.language as tl
 
 from kernels.argmax import argmax, greedy_tokens
 from kernels.rmsnorm import add_rms_norm, embed_rms_norm, rms_norm
@@ -95,6 +97,33 @@ PACE_MEDIAN = 0.88
 #: floor (offline: 0.66 at 2048 tokens, batch one). Never above PACE_FLOOR.
 WORST_PASSES = 0.90
 PACE_FLOOR_MIN = 0.60
+
+
+# --- DIAGNOSTIC, NOT A CANDIDATE: price one kernel boundary -------------------
+# NVIDIA's r560 microbenchmark puts device-side graph replay at 0.53-0.70 us a
+# node; our own candidate-to-candidate deltas imply nearer 2.9 us. The whole
+# kernel-fusion track is worth 5x more at the second figure than the first, so
+# it is worth one run to find out before writing any fusion. This appends
+# PROBE_NODES kernels that touch no memory to the captured verify pass and
+# changes nothing else, so every token is identical and only the pass time
+# moves: at 0.65 us a node the pass grows 4.8%, at 2.9 us it grows 21.6%, and
+# public-0 TPOT tracks pass time through the pacer. Those are far enough apart
+# to read in a single run.
+#
+# REMOVE THIS BEFORE THE TREE GOES ANYWHERE NEAR THE TRUNK.
+PROBE_NODES = 300
+
+
+@triton.jit
+def _nothing(SEQ: tl.constexpr):
+    """A launch and nothing else: no loads, no stores, no shared memory."""
+    pass
+
+
+def _node_probe():
+    if PROBE_NODES and torch.cuda.is_available():
+        for index in range(PROBE_NODES):
+            _nothing[(1,)](SEQ=index, num_warps=1)
 
 
 class Mailbox:
@@ -461,6 +490,7 @@ class DecodeState:
         self.spec_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.spec_graph, stream=stream):
             self.speculate()
+            _node_probe()
         current.wait_stream(stream)
         # The pass time sets the release pace that bounds sample-to-sample
         # spread. Passes run back to back in a generation, so they are timed

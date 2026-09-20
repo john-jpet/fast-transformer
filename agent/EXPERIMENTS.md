@@ -1825,3 +1825,57 @@ change and was cancelled rather than risk a second failed slot.
 `engine/` is now identical to `c758faf`. This is the base every later change is
 measured against, one change per run, across three queues: SSS and Silver
 Bullet take the small single edits, dryfter takes architectural attempts.
+
+Result (candidate 105, lead-in replay, `661376a`): **1122.2 raw, 1114.4
+normalized, node -0.7%, 688 s** - 2.6% under the base. **DISCARD.** The change
+was confounded by my own cost-neutrality choice: it added the untimed lead-in
+*and* cut the groups from five to four to keep the replay count at twenty.
+`pass_seconds` is `min(times)`, and the minimum of four draws is higher than
+the minimum of five, so the group cut raises the pass time and slows the pacer.
+The two effects cannot be separated from this run.
+
+Result (candidate 104, refine budget share, dryfter `79f4f15`): **1108.8 raw,
+1121.5 normalized, node +1.1%, 711 s** - 1.9% under the base. **DISCARD.**
+
+## The pattern across candidates 102, 104 and 105
+
+| candidate | what it touched | normalized |
+| --- | --- | ---: |
+| base `c758faf` | - | 1143.7 |
+| `7928148` | `num_stages` 2->3 (pure kernel config) | 1143.6 |
+| `4fbebc7` c102 | host spin loop | 1122.4 |
+| `79f4f15` c104 | refine budget allocation | 1121.5 |
+| `661376a` c105 | pass-time measurement | 1114.4 |
+| `9a68694` c103 | split counts (pure kernel config) | 1094.6 |
+
+Three unrelated changes that all touch the **warmup / host measurement path**
+land 1.9-2.6% under the base, while the one pure kernel-config change that was
+genuinely neutral measured neutral to a tenth of a point. Two base-tree draws
+agree at 1143.7 and 1143.6, so the base is not a lucky high draw.
+
+The reading: the engine is **tuned to its current warmup timing behaviour**.
+`refine` picks layouts by timing them, and the pacer's floor is set from
+`min(times)`; perturb either and different layouts win and the floor moves.
+That equilibrium is worth more than any of the three changes was.
+
+**Working rule: stop perturbing warmup scheduling and host measurement.** Spend
+slots on kernel and arithmetic changes that leave the tuning loop alone. The
+warmup-cost items from the outside report (manual `capture_begin`/`capture_end`,
+parallel launcher builds, `TRITON_DISABLE_LINE_INFO`) are still worth doing -
+they cut wall-clock without changing what gets measured or chosen - but they
+must be built so the sequence of timings `refine` sees is unchanged.
+
+## The draft side is closed
+
+Offline simulation over cached traces (`~/.cache/fasty-lab/plan/graft_sim.md`):
+baseline 1.832 accepted tokens per pass at T16, 1.716 at T8. A Graft-style
+confidence prune with refill is **+0.2%** end to end; direct pruning is -0.9%;
+refilling from successor entries 2-8 is -1.2% (entry 1 is the best refill there
+is). The decisive number is the **hindsight oracle over per-position budget -
+an upper bound on any confidence signal - at only +3.1%**, and 0.00% at T=2;
+the realisable policy captures 7-9% of that. Two of Graft's three parts are
+already shipped. Every mean-improving variant also raises p90 while leaving p10
+alone, which is exactly what `PACE_FLOOR` discards at batch 1.
+
+So passes per token is **not** the remaining +4.9%. Pass *time* at batch 1 is
+the only lever left, and it converts 1:1 through the pacer.

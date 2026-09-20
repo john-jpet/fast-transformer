@@ -108,9 +108,9 @@ PACE_FLOOR_MIN = 0.60
 
 # Conservative first fixed-mask self-drafting experiment.  The target path
 # never consults this mask: only the speculative proposal forward passes it.
-# Keep only the first and last nine blocks (50% retained) for the aggressive
-# companion experiment. The full verification pass remains unchanged.
-DRAFT_LAYER_MASK = tuple(index < 9 or index >= 27 for index in range(36))
+# Keep only the first and last four blocks (about 22% retained) for the most
+# aggressive probe. The full verification pass remains unchanged.
+DRAFT_LAYER_MASK = tuple(index < 4 or index >= 32 for index in range(36))
 
 
 # --- DIAGNOSTIC, NOT A CANDIDATE: price one kernel boundary -------------------

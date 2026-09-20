@@ -1941,3 +1941,8 @@ Two variants are being dispatched: 80% of blocks retained, then 50% retained.
 Expected outcome is either a large speedup or an incorrect-output rejection;
 the result distinguishes whether the platform's quality gate permits this
 class of exact-verification architecture.
+
+Third probe: retain only the first and last four blocks (22% retained) in the
+draft path. This is intentionally beyond a plausible production setting and
+measures the shallowest stem/head draft that still preserves the exact full
+model verification path.

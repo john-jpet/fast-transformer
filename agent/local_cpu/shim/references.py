@@ -86,7 +86,7 @@ def _first_best(grid, best_value, best_index, out, BLOCKS, BLOCK_B, **launch):
 
 @reference("_fused_block_argmax")
 def _fused_block_argmax(grid, x_ptr, weight_ptr, best_value, best_index, M, N, K, BLOCK_N, BLOCK_K, BLOCK_M, EVEN_M, **launch):
-    assert grid[0] * BLOCK_N == N and K % BLOCK_K == 0 and BLOCK_M >= M
+    assert grid[0] * BLOCK_N == N and K % BLOCK_K == 0 and grid[1] * BLOCK_M >= M
     x = flat(x_ptr, M * K).view(M, K).to(F32)
     weight = flat(weight_ptr, N * K).view(N, K).to(F32)
     logits = (x @ weight.T).to(BF16).to(F32)                       # rounded like the projection

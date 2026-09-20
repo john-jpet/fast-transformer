@@ -147,7 +147,7 @@ def argmax():
 def fused_argmax():
     """kernels/argmax.py fused lm_head+argmax == torch.argmax of the BF16-rounded product (first index on ties)."""
     from kernels.argmax import fused_argmax as kernel
-    for m, n, k in ((16, 640, 256), (5, 512, 384), (20, 1280, 128), (32, 256, 256)):
+    for m, n, k in ((16, 640, 256), (5, 512, 384), (20, 1280, 128), (32, 256, 256), (64, 256, 256)):
         x = torch.randn(m, k).bfloat16(); w = (torch.randn(n, k) * 0.05).bfloat16()
         want = (x.float() @ w.float().T).bfloat16().argmax(-1)
         report(f"fused_argmax m={m} n={n} k={k}", kernel(x, w), want)

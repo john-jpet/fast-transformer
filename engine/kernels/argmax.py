@@ -75,7 +75,8 @@ def _fused_block_argmax(
     """
     pdl_wait()  # before any global memory access
     tile = tl.program_id(0).to(tl.int64)
-    rows = tl.arange(0, BLOCK_M)
+    row_base = tl.program_id(1).to(tl.int64) * BLOCK_M
+    rows = row_base + tl.arange(0, BLOCK_M)
     columns = tile * BLOCK_N + tl.arange(0, BLOCK_N)
     k = tl.arange(0, BLOCK_K)
     w_ptrs = weight_ptr + columns[:, None] * K + k[None, :]
@@ -100,10 +101,10 @@ _FUSED = {}
 
 
 def fused_argmax(x, weight, block_n=64, block_k=128):
-    """argmax(x @ weight.T) for <= 32 BF16 rows without materializing the logits; None if not applicable."""
+    """argmax(x @ weight.T) for <= 64 BF16 rows without materializing the logits; None if not applicable."""
     rows, k = x.shape[0] * (x.shape[1] if x.dim() == 3 else 1), x.shape[-1]
     n = weight.shape[0]
-    if rows > 32 or n % block_n or k % block_k or x.dtype != torch.bfloat16 or not weight.is_contiguous():
+    if rows > 64 or n % block_n or k % block_k or x.dtype != torch.bfloat16 or not weight.is_contiguous():
         return None
     flat = x.reshape(rows, k).contiguous()
     block_m = 16 if rows <= 16 else 32
@@ -111,9 +112,10 @@ def fused_argmax(x, weight, block_n=64, block_k=128):
     best_value = torch.empty((rows, tiles), dtype=torch.float32, device=x.device)
     best_index = torch.empty((rows, tiles), dtype=torch.int64, device=x.device)
     out = torch.empty(x.shape[:-1], dtype=torch.int64, device=x.device)
-    _fused_block_argmax[(tiles,)](
+    _fused_block_argmax[(tiles, triton.cdiv(rows, block_m))](
         flat, weight, best_value, best_index, M=rows, N=n, K=k,
-        BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, EVEN_M=rows == block_m, num_warps=4, num_stages=2,
+        BLOCK_N=block_n, BLOCK_K=block_k, BLOCK_M=block_m, EVEN_M=rows % block_m == 0,
+        num_warps=4, num_stages=2,
     )
     _first_best[(rows,)](best_value, best_index, out, BLOCKS=tiles, BLOCK_B=triton.next_power_of_2(tiles), num_warps=4)
     return out
@@ -129,7 +131,7 @@ def greedy_tokens(x, weight, linear):
     key = (x.device, rows, weight.shape[0], weight.shape[1])
     if key not in _FUSED:
         _FUSED[key] = False
-        if 4 < rows <= 32 and not torch.cuda.is_current_stream_capturing():
+        if 4 < rows <= 64 and not torch.cuda.is_current_stream_capturing():
             try:
                 generator = torch.Generator(device=x.device).manual_seed(4242)
                 probe = torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)

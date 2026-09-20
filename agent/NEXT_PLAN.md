@@ -144,3 +144,22 @@ paired gate/up block kernel, learned ranker kernel.
   kernel (published: 1.07-1.17x on attention at batch 16, ~0 at batch 1).
   Activations live in graph-private pools whose addresses are only known at
   capture: no descriptors for x tiles.
+
+## Correction to the deep-research plan (2026-09-19 22:30 UTC)
+
+W2's premise is refuted, but in our favour. The offline harness never passed
+`divisible_by_16`, so it measured a compiler that had been told the pointers
+might be unaligned. With the attributes the JIT really passes:
+- the tile GEMMs ALREADY emit `cp.async` (27 groups at num_stages 2, 39 at 3,
+  51 at 4, 63 at 5; 20 KB of shared memory per stage of the 227 KB per SM),
+- both attention kernels already emit `cp.async` (39 / 78 with the prefix loop),
+- the small fused kernels already emit `ld.global.v4`, not scalar `b16`,
+- `tl.range(num_stages=)` adds nothing the kernel argument does not already do.
+So there is no unexploited pipelining to switch on, and the plan's 20-28%
+estimate does not exist. What DOES exist is the depth knob itself, which the
+engine set to 2 everywhere on the belief that it was inert: candidate 96 gives
+`exact`/`trans`/`hoist` three stages and leaves `gemm` at two so warmup times
+them against each other.
+The one surviving piece of the original reading: a masked load whose bound the
+compiler cannot prove aligned stays scalar. Every hot loop in the engine either
+is unmasked or has a constexpr/divisible bound, so there is nothing to collect.

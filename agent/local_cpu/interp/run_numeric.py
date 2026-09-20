@@ -177,5 +177,14 @@ def qkrope_table():
     report("qk_rope table mode == gathered mode (keys)", caches[1][0], caches[0][0])
     report("qk_rope table mode == gathered mode (values)", caches[1][1], caches[0][1])
 
-which = sys.argv[1:] or ["qkrope_table", "fused_argmax", "argmax", "qkrope", "splitpath", "rmsnorm", "swiglu", "linear", "attention"]
+def embed_norm():
+    """Embedding gather + first norm in one kernel == gather then rms_norm, bit for bit."""
+    from kernels.rmsnorm import rms_norm, embed_rms_norm
+    table = (torch.randn(50, 256) * 0.05).bfloat16(); w = (torch.randn(256) * 0.1 + 1).bfloat16()
+    ids = torch.tensor([[3, 49, 0, 7], [12, 12, 1, 30]])
+    out, hidden = embed_rms_norm(ids, table, w, 1e-6)
+    report("embed_rms_norm hidden == table[ids]", hidden, table[ids])
+    report("embed_rms_norm normalized == rms_norm(table[ids])", out, rms_norm(table[ids].contiguous(), w, 1e-6))
+
+which = sys.argv[1:] or ["embed_norm", "qkrope_table", "fused_argmax", "argmax", "qkrope", "splitpath", "rmsnorm", "swiglu", "linear", "attention"]
 for name in which: section(globals()[name])

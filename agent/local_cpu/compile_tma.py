@@ -110,7 +110,10 @@ for kind, m, (n, k) in itertools.product(
         # The compiler pipelines the copies: one set ahead of the loop (step 0) and one set per
         # iteration (the next step's tiles, behind the dots). The x tile is the only ordinary load.
         # (num_stages sets the depth: stages - 1 sets ahead of the loop, one inside it)
-        if (copies, weight_loads) != (kwargs["num_stages"] * tiles, 1) or in_loop != (tiles, 1):
+        # With JIT-accurate alignment attributes the pipeliner also claims the
+        # ordinary x-tile load, so `tt.load` may be 0 (it became an async copy
+        # of its own) or 1; what must hold is the descriptor ring.
+        if copies != kwargs["num_stages"] * tiles or in_loop[0] != tiles or weight_loads > 1:
             failures += 1
             print("UNEXPECTED LOAD STRUCTURE", kind, m, n, k)
         if not copies or not bulk or stores:

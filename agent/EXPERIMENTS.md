@@ -1506,3 +1506,376 @@ batch 32-64 x 2048 context the K/V read (20 GB per step at batch 64) is most
 of the step. A 4 s search now runs only when the batch exceeds 16; the public
 shapes (batch 1/4/16) are untouched. Smoke: batches 20 and 40 exercised the
 search on CPU (0 mismatches).
+
+## Merged team runs (from 20:35 UTC)
+
+The organisers allowed the three teams (SSS, dryfter, Silver Bullet) to merge;
+their repositories are extra run queues. Dispatch is one candidate per repo
+through a fast-forward merge commit (their history stays), pushed by the user
+(the auto-mode classifier blocks pushes to other repos from here). Their run
+results are visible only as each team's leaderboard best, so a dispatched
+candidate reads out only when it beats that team's previous best.
+- dryfter `33e665e` <- candidate 86 tree (`a8e5228`): c85 + plain-decode
+  attention search above batch 16. Their previous best: 1123.9.
+- Silver Bullet <- candidate 85 tree (`53e4a7a`, second draw): pending (their
+  main moved during the first attempt).
+
+Result (candidate 82 = c80 + fused lm_head/argmax knob, per-batch table
+reverted): commit `f8da493` succeeded, **1121.4** (normalized 1125.3), 745 s.
+Public TPOT 2.915 / 3.711 / 4.148 ms: batch 1 back to normal with PDL still ON
+(c80's 3.389 was a warmup-tuning draw, not PDL), batch 4 the best ever. Keep.
+PLATEAU: c76, c80, c82 all normalize to 1125-1127; c67's 1130.6 was a good
+draw of the same level (its rerun: 1118.4). c85 (PDL off + mailbox + rope
+tables) is the PDL A/B. Warmup tuning outcomes vary per run and move public
+TPOT by up to 10%: treat single public probes accordingly.
+
+## Candidate 87 - pass time for the floor = fastest of five back-to-back groups
+
+At batch 1 every sample is paced at 0.70 x the warmup-measured pass time, so a
+high reading there slows the whole workload: the same kernels gave floor-set
+public-0 TPOT of 2.857 (c76), 2.915 (c82) and 3.389 ms (c80). The measurement
+now takes the minimum of five groups of four back-to-back replays (was the
+median of three): interference and clock ramp can only push readings up, and
+the pacing simulation calibrated the floor in units of the true pass time.
+Pushed with candidate 86 (plain-decode attention search above batch 16: hidden
+shapes only). Read-out: public-0 TPOT should sit at the low end of its range.
+
+## Candidate 88 - embedding gather fused into the first norm (held)
+
+Decode steps and verify blocks start with `embed_tokens(token_ids)` (a gather
+kernel writing [rows, 2560]) and then the first layer's RMSNorm reading it
+back. `_embed_rms_norm_kernel` does both in one launch: it loads the
+embedding row, stores it as the residual stream, and normalizes it with the
+same cast placement as `_rms_norm_kernel`. Prefill keeps the native path.
+Interpreter: the residual equals table[ids] and the normalized output equals
+rms_norm(table[ids]) bit for bit; cuda:90 compile; smoke test 0 mismatches
+(344 launches). One launch and one [rows, 2560] read fewer per pass.
+
+Result (candidate 85 = c82 with PDL OFF + pinned-memory completion stamps +
+in-place RoPE tables): commit `53e4a7a` succeeded, **1140.0 - NEW BEST, #1**
+(normalized 1135.3, node 0.4% fast; the c67-class plateau was 1125-1127), and
+the fastest run yet at **648 s**. Public TPOT 2.853 / 3.810 / 4.082 ms - the
+best batch-1 ever measured (c67: 2.994) and the second-best batch-16. Keep.
+Reading: PDL off (-13% batch-1 penalty gone) + three fewer launches per pass
+(RoPE tables) + no trapped event ioctls per pass (mailbox) + the fused
+lm_head/argmax knob. Small, verified, stacked wins are what moves this engine.
+
+Merged-team read-out (leaderboard is the only visible signal for the other two
+teams): **Silver Bullet 1112.7 -> 1137.7** after the candidate-85 tree was
+pushed there (`c3120ff`). Two independent draws of that engine now exist,
+1140.0 and 1137.7, so candidate 85 is a real level, not a lucky draw. dryfter
+still shows 1123.9: their candidate-86 run either has not finished or did not
+beat their previous best.
+
+## Candidate 89 - pinned buffers read through numpy views; a deeper pass queue above batch 2
+
+`host_passes` / `host_tokens` are read through `.numpy()` views made once, so
+a pass read is a memory access rather than a torch call building Python lists
+per row. `SPEC_LOOKAHEAD_WIDE = 3` for batches above 2 (the release pace binds
+only at batch 1-2; above that the queue exists only to keep the GPU from
+waiting on the host between passes). Read-out: public-2 TPOT.
+
+Result (candidates 86+87): commit `425f95f` succeeded, **1119.2** (normalized
+1117.3; c85: 1135.3), 697 s. Public TPOT 2.893 / 4.057 / 4.122 ms - batch 1
+did not fall despite candidate 87 lowering the measured pass time, and batch 4
+rose. -1.6% is at the edge of the +/-1.3% noise, so the bundle is split rather
+than condemned: candidate 86 (the 4 s plain-decode attention search above
+batch 16) is REVERTED - it is the only part that changes which kernel runs on
+hidden shapes and it adds warmup to exactly those workloads. Candidate 87 (the
+pacing floor's pass time = fastest of five back-to-back groups) stays: it only
+changes a measurement, and c88 (measuring) already carries both.
+
+Result (candidate 88, embedding gather fused into the first norm, on the
+c86+87 base): commit `92386d2` succeeded, **1118.7** (normalized 1114.8), 663 s
+- level with its parent (1117.3), so the fusion is neutral on its own and the
+c86 regression is still inside it. Candidate 90 (`6d93ee0`, c86 reverted +
+numpy views + deeper queue) is the test that the 1135 level returns.
+
+Dead offline, no run spent: **alignment hints** (`tl.max_contiguous` /
+`tl.multiple_of`) change NOTHING in the PTX of the small fused kernels (still
+64 scalar `ld.global` in RMSNorm, zero `.v2`/`.v4` in every variant), and a
+mask-free chunked rewrite reads each row twice - worse for a bandwidth-bound
+kernel. Triton 3.1 does not vectorise these BF16 masked loads at all.
+
+## Candidate 91 - warp-width knobs for 17-64-row blocks and the embedding norm
+
+`add_rms_norm` and `swiglu` only offered their launch-width knob at <= 16 rows;
+verify blocks run 16-64 rows (batch 4 x 8, batch 16 x 4), where they are the
+two most-launched kernels (72 + 36 per pass). The knob now covers <= 64 rows,
+and the new embedding+norm kernel gets one too. Same kernel, same values, the
+captured pass decides. Interpreter: 13 PASS across the touched kernels; smoke
+test 0 mismatches.
+
+Merged-team read-out: **dryfter 1123.9 -> 1136.5**. All three queues now sit at
+1136-1140; the dispatches are producing.
+
+## Candidate 92 - refinement budget 16 -> 24 s
+
+Runs now finish in 648-700 s of the 900 s limit. In-graph refinement is the
+only place a layout is judged in the real captured pass (isolated timings
+choose the starting points), and the warmup audit estimated it reaching two or
+three options per block size. Budget back to 24 s, split across block sizes:
+about +8 s per workload, so roughly 700-750 s per run. Read-out: duration
+first, then public-1/2 TPOT (the GEMM kinds are what refinement chooses
+between).
+
+Result (candidate 90 = c86 reverted + numpy views + a third pass in flight
+above batch 2): commit `6d93ee0` succeeded, **1122.1** (normalized 1122.2),
+729 s. Reverting c86 recovered +0.7% over c88, but the run is still 1.2% under
+candidate 85 (1135.3), and three runs in a row have sat below it. Public TPOT
+2.965 / 3.914 / 4.157 vs c85's 2.853 / 3.810 / 4.082: every shape slightly
+slower, worst at batch 4/16 - the signature of the DEEPER PASS QUEUE (passes
+enqueued for the slowest row are still in flight when the generation ends, so
+the next sample's prefill queues behind them; the whole-system review called
+this out at lookahead 2 already). `SPEC_LOOKAHEAD_WIDE` back to 2. The numpy
+views and candidates 87/88 stay (both measured neutral on their own).
+
+Result (candidate 91, `c758faf`): **1144.3**, normalized **1143.7**, 692 s;
+public TTFT/TPOT 10.5/3.021, 118.7/3.807, 107.6/4.180 ms. New best.
+This supersedes the old handoff's apparent regression; do not revert c87/c88
+while c93 (two passes + 24 s refinement) is still measuring.
+
+## Candidate 94 - direct host-memory completion-stamp reads
+
+Hypothesis: `Mailbox.ready` still polls `int(self.flags[slot])`, constructing
+and extracting a Torch scalar on every spin. Cache `flags.numpy()` once and
+read the shared view, like the existing token and pass buffers. The pinned
+allocation, ordered payload/stamp copies, generation sequence numbers, timeout,
+and event fallback remain the same. No model operation or launch changes.
+Local CPU timing measures host overhead only; the remote run decides payoff.
+
+Local c94 checks: 10 unit tests, archive validation (45,960 bytes), full
+interpreter suite, and 4-layer real-model CPU smoke (115 s, 0 mismatches,
+105 kept-alternative relocations) passed. Mailbox alias/stale-generation/
+fallback checks passed; Mac poll microbenchmark: Torch 654 ns, view 124 ns
+(medians of five 100,000-call runs). No GPU-speed claim from that timing.
+
+## Candidate 95 - TMA weight loads in the fused vocabulary projection
+
+Hypothesis: the optional fused lm_head/argmax still uses ordinary BF16 loads,
+while the main skinny GEMMs already benefit from Hopper's pipelined TMA loads.
+Use the existing aligned [64,128] weight descriptor in that kernel, retaining
+its ascending K reduction, BF16 cast before argmax, and lowest-index tie rule.
+The existing numerical agreement check and captured-pass refinement still
+control whether the fused path is used. No new tuning option; one specialization
+replaces the old one where a descriptor is available. The ordinary-load path
+remains the fallback. Local compilation must show the async copies and WGMMA;
+CPU tests can exercise the fallback but cannot establish descriptor correctness.
+
+Local c95 checks passed: 10 unit tests, 46,129-byte validated archive,
+118 interpreter PASS lines plus 7 descriptor-coordinate/tie/fallback checks,
+4-layer whole-engine smoke (116 s, 0 mismatches), and all H100 offline
+argmax compiles. TMA specializations compiled in 0.5 s locally at each
+of 5/16/32 rows, with async tensor loads and WGMMA in PTX. CPU descriptor
+emulation checks indexing; real async-copy correctness remains a GPU gate.
+
+## Candidate 96 - incremental draft-sibling membership
+
+Hypothesis: `_propose` repeatedly broadcasts [history positions] against
+[all sibling lanes] to reject duplicate candidates, even though an iteration
+adds just one sibling. Maintain a one-dimensional `taken` mask, seeded with
+first draft/stale hint/sentinel, and OR in each successfully inserted token.
+The later successor-table fill is unchanged. This must produce identical
+drafts, chains and phases; no acceptance-policy change is intended. Expected
+benefit: fewer comparisons and reductions, especially on long histories.
+
+Local c96 checks: 300 speculation interpreter cases (248 alternative branches)
+match the reference; full interpreter suite has 118 PASS lines; 10 unit tests,
+archive validation (46,068 bytes), H100 speculation compiles and whole-engine
+CPU smoke (122 s, zero mismatches) pass. Compiler comparison at SIZE=551,T=16:
+PTX lines 10,134 -> 2,626; static shared memory 1,024 -> 32 bytes. T=8:
+5,385 -> 2,355 lines; T=4,SIZE=2086: 5,225 -> 4,058. These are compiler
+metrics, not latency measurements.
+
+Session read-out / dispatch notes (2026-09-19 21:50 UTC):
+- c93 `44edf62`: 1103.3, normalized 1111.5, 833 s. No evidence for the larger
+  refinement budget; c91 remains best. c94 repeats this base with only a host
+  polling change, so it is useful evidence about tuning variance.
+- c94 `9e15bd4`: SSS run `384e1371-67ac-48a7-b460-e23c1762880a`, measuring;
+  dryfter merge `61cef2a`, dispatched. Archive upload returned HTTP 405;
+  GitHub pushes are the working submission path. Canceled the documentation-only
+  duplicate `21cb72e2-9d9b-4435-ae1c-d4bb8ca0ed06` before it started.
+- c95 `0fbb6d7`: Silver Bullet merge `77f25a5`, dispatched separately from c96.
+- Claude's adversarial review agrees c94 is correct but estimates <0.02% score
+  effect: most faster polling only increases busy-wait iterations. Treat its
+  microbenchmark as host overhead only. The worthwhile follow-up is fresh paired
+  incumbent/challenger timings in refine(), which currently compares against a
+  minimum that can be 20 seconds old. A suggested 20 ms mailbox timeout is NOT
+  adopted: ordinary prefill itself takes over 100 ms. The forced-usable mailbox
+  check did exercise ready(); the CPU smoke alone does not.
+
+Result (candidate 91, `c758faf`): **1144.3 - BEST** (normalized 1143.7), 692 s.
+Warp-width knobs for 17-64-row blocks, on top of the numpy views and a queue of
+three passes above batch 2. Note this tree HAS `SPEC_LOOKAHEAD_WIDE = 3`: the
+earlier suspicion that the third pass in flight was the c90 regression was
+wrong.
+Result (candidate 93, `44edf62`, refine budget 24 s + lookahead back to 2):
+**1103.3** (normalized 1111.5) in **833 s** - the longest run since the cap
+cancellations. The budget is the regression: warmup compile time is the binding
+constraint, and 8 s x 6 workloads bought nothing. Codex's follow-ups from that
+base: `9e15bd4` (mailbox read through a shared numpy view) 1130.9 / 1136.7
+normalized, 700 s; `5d61f22` (incremental draft sibling membership) canceled.
+
+## Candidate 95 - back to the candidate-91 knobs, keeping the newer host reads
+
+`seconds` 24 -> 16 and `SPEC_LOOKAHEAD_WIDE` 2 -> 3, i.e. exactly candidate
+91's tuning configuration, with Codex's shared-view mailbox read and the
+incremental sibling membership kept on top. Read-out: duration back to ~690 s
+and the score back to the 1140s.
+
+## Harness correction — several recorded dead ends were measurement artifacts
+
+`agent/local_cpu/offline_compile.py` built its `ASTSource` WITHOUT an
+`AttrsDescriptor`, so every offline compile told the compiler the pointers
+might be unaligned. Triton then refuses to vectorise (`vec = min(ptrContiguity,
+maskAlignment)`) and refuses to pipeline (`vec * bitwidth < 32` is dropped).
+The harness now passes `divisible_by_16` for every pointer plus any integer
+argument named in `divisible=`, exactly as the JIT launcher derives it. What
+changes when you ask the question correctly:
+
+| kernel | old (wrong) reading | true |
+|---|---|---|
+| `_rms_norm_kernel` | 64 scalar `ld.global.b16` | 8 x `ld.global.v4` |
+| `add_rms_norm` / `embed_norm` / `swiglu` | scalar | 12 / 8 / 2 x `v4` |
+| `_exact_gemm`, `_trans_gemm`, `_skinny_gemm` | no `cp.async`, PTX identical for num_stages 1-4 | **27 `cp.async` groups at num_stages 2, 39 at 3, 51 at 4, 63 at 5** |
+| `_gemv` | scalar | 4 x `v4` + 1 x `v2` |
+
+So: the small fused kernels were already vectorised, the GEMMs were already
+software-pipelined, and **`num_stages` was never inert** - three recorded dead
+ends (num_stages sweep, alignment hints, "Triton 3.1 does not vectorise BF16")
+died on bad evidence. A masked load with an unprovable bound is still scalar,
+which is the one part of the earlier reading that survives.
+
+## Candidate 96 - three-deep software pipeline for the non-TMA tile GEMMs
+
+`DEEP_STAGES = 3` for `exact`, `trans` and `hoist` (the `gemm` incumbent stays
+at two, so each shape's warmup times a two-stage and a three-stage kernel
+against each other and cuBLAS). Shared memory 20 -> 40 KB per CTA of the 227 KB
+per SM; the pipeline goes from 27 to 39 `cp.async` groups. Numerically
+identical - `num_stages` only schedules the copies. Checks: every offline
+compile script (0 failures, TMA/tmap structure assertions updated for the
+corrected harness), interpreter suite, smoke test, unit tests.
+
+## Candidate 97 - skip a deeper-pipeline variant whose base kind lost to cuBLAS
+
+`_choose` compiles and times every candidate in the list. `tmap3` is `tmap`
+with one more prefetch stage; if `tmap` was already slower than cuBLAS at that
+shape, the deeper one cannot win it back, and its compile is pure cost against
+the 900 s run limit that six workloads share (runs have varied 692-833 s for
+near-identical trees). One compile saved per losing shape, up to ~5 shapes x 6
+workloads. Purely a warmup economy: nothing about the chosen layout changes.
+
+Result (candidate 96, three-deep pipeline): commit `a3696f5` **CANCELED at
+919 s** of the 900 s limit; `5d61f22` before it was canceled at 915 s. Run time
+across near-identical trees has run 692 / 700 / 773 / 915 / 919 s, so the
+engine now sits ON the cap and the node's compile speed decides whether a run
+finishes at all. `DEEP_STAGES` back to 2 (its benefit was never measured -
+the run died in warmup).
+
+## Candidate 98 - cut warmup back under the cap
+
+`DEEP_STAGES` 3 -> 2, `_PROCESS_SECONDS` 28 -> 22, refine 16 -> 12 s, plus
+candidate 97's skip of a deeper-pipeline candidate whose base kind already lost
+to cuBLAS. Target: back to ~700 s with margin for a slow node. Read-out:
+duration first - a finished run is worth more than any layout.
+
+## Candidate 99 - name the Triton cache directory so it survives the six workloads
+
+Each workload is a fresh process and the warmup audit puts 45-55 s of its 65-75 s
+load/warmup in Triton compilation; six of those share the 900 s run limit, and
+two runs have now been cancelled at 915-919 s. Triton keys its on-disk cache by
+source plus constants, so every kernel whose shape repeats across workloads is a
+hit - but the default cache lives under HOME, which we do not own on this
+platform. `engine.py` now sets `TRITON_CACHE_DIR=/tmp/fasty-triton-cache` (before
+importing torch/triton) and falls back silently if it cannot be created. If the
+six workloads share a container this is worth 100-200 s per run; if each gets a
+fresh one it is a no-op. Either way nothing about the engine's arithmetic or
+layout choices changes. Read-out: run duration.
+
+Result (candidate 98, warmup cut back): commit `bec0e9f` succeeded in **692 s**
+- the cap risk is gone - but scored **1111.9** (normalized 1109.3). Cutting the
+tuning budgets costs layout quality: public-0 TPOT 3.165 ms against candidate
+91's 3.021. Note candidate 91 ran its 28 s / 16 s budgets in 692 s too, so the
+budgets were never what put runs at 915-919 s; `DEEP_STAGES = 3` and whatever
+`5d61f22` added were.
+
+## Candidate 100 - reset to the 1144.3 tree, plus the named Triton cache only
+
+Normalized scores of the last five runs: 1143.7 (c91), 1136.7, 1123.6, 1109.3,
+each a small edit on the one before, each a little worse, none individually
+outside the +/-1.3% noise. That is a drift, not a sequence of measurements. So
+`engine/` is reset to exactly candidate 91's tree (`c758faf`, the 1144.3 run)
+and the ONLY change on top is `TRITON_CACHE_DIR` - a warmup economy that cannot
+touch arithmetic or layout choice. Everything since candidate 91 (the mailbox
+numpy view, the incremental sibling membership, the budget trims, the pruning,
+the pipeline depth) is set aside and comes back one per run, each measured
+against this base.
+
+Result (candidate 99, named Triton cache on the candidate-98 tree): commit
+`f02f277` **FAILED - `incorrect_output` on a hidden case** (all three public
+cases passed). Candidate 98, the same tree without the cache, passed. A cache
+directory under `/tmp` shared by six workload processes is a plausible
+mechanism: concurrent writes of the same entry can be read torn. The warmup
+saving is not worth a wrong token, so `TRITON_CACHE_DIR` is REMOVED and must
+not come back without per-process isolation. Candidate 100 carried the same
+change and was cancelled rather than risk a second failed slot.
+
+## Candidate 101 - the 1144.3 tree, byte for byte
+
+`engine/` is now identical to `c758faf`. This is the base every later change is
+measured against, one change per run, across three queues: SSS and Silver
+Bullet take the small single edits, dryfter takes architectural attempts.
+
+Result (candidate 105, lead-in replay, `661376a`): **1122.2 raw, 1114.4
+normalized, node -0.7%, 688 s** - 2.6% under the base. **DISCARD.** The change
+was confounded by my own cost-neutrality choice: it added the untimed lead-in
+*and* cut the groups from five to four to keep the replay count at twenty.
+`pass_seconds` is `min(times)`, and the minimum of four draws is higher than
+the minimum of five, so the group cut raises the pass time and slows the pacer.
+The two effects cannot be separated from this run.
+
+Result (candidate 104, refine budget share, dryfter `79f4f15`): **1108.8 raw,
+1121.5 normalized, node +1.1%, 711 s** - 1.9% under the base. **DISCARD.**
+
+## The pattern across candidates 102, 104 and 105
+
+| candidate | what it touched | normalized |
+| --- | --- | ---: |
+| base `c758faf` | - | 1143.7 |
+| `7928148` | `num_stages` 2->3 (pure kernel config) | 1143.6 |
+| `4fbebc7` c102 | host spin loop | 1122.4 |
+| `79f4f15` c104 | refine budget allocation | 1121.5 |
+| `661376a` c105 | pass-time measurement | 1114.4 |
+| `9a68694` c103 | split counts (pure kernel config) | 1094.6 |
+
+Three unrelated changes that all touch the **warmup / host measurement path**
+land 1.9-2.6% under the base, while the one pure kernel-config change that was
+genuinely neutral measured neutral to a tenth of a point. Two base-tree draws
+agree at 1143.7 and 1143.6, so the base is not a lucky high draw.
+
+The reading: the engine is **tuned to its current warmup timing behaviour**.
+`refine` picks layouts by timing them, and the pacer's floor is set from
+`min(times)`; perturb either and different layouts win and the floor moves.
+That equilibrium is worth more than any of the three changes was.
+
+**Working rule: stop perturbing warmup scheduling and host measurement.** Spend
+slots on kernel and arithmetic changes that leave the tuning loop alone. The
+warmup-cost items from the outside report (manual `capture_begin`/`capture_end`,
+parallel launcher builds, `TRITON_DISABLE_LINE_INFO`) are still worth doing -
+they cut wall-clock without changing what gets measured or chosen - but they
+must be built so the sequence of timings `refine` sees is unchanged.
+
+## The draft side is closed
+
+Offline simulation over cached traces (`~/.cache/fasty-lab/plan/graft_sim.md`):
+baseline 1.832 accepted tokens per pass at T16, 1.716 at T8. A Graft-style
+confidence prune with refill is **+0.2%** end to end; direct pruning is -0.9%;
+refilling from successor entries 2-8 is -1.2% (entry 1 is the best refill there
+is). The decisive number is the **hindsight oracle over per-position budget -
+an upper bound on any confidence signal - at only +3.1%**, and 0.00% at T=2;
+the realisable policy captures 7-9% of that. Two of Graft's three parts are
+already shipped. Every mean-improving variant also raises p90 while leaving p10
+alone, which is exactly what `PACE_FLOOR` discards at batch 1.
+
+So passes per token is **not** the remaining +4.9%. Pass *time* at batch 1 is
+the only lever left, and it converts 1:1 through the pacer.

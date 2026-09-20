@@ -98,7 +98,9 @@ for kind, m, (n, k) in itertools.product(
         # Depth 2 = the K loop inside the tile loop: one pipelined copy + the x load. Depth 1 = the tile
         # loop body outside the K loop: the hoisted prefetch copies (num_stages - 1). Depth 0: nothing.
         stages = kwargs["num_stages"]
-        if census != {1: (stages - 1, 0), 2: (1, 1)}:
+        # With JIT-accurate alignment attributes the x load is pipelined too, so
+        # the K loop may show 0 ordinary loads instead of 1.
+        if census not in ({1: (stages - 1, 0), 2: (1, 1)}, {1: (stages - 1, 0), 2: (1, 0)}):
             failures += 1
             print("UNEXPECTED LOAD STRUCTURE", kind, m, n, k)
         if not copies or not bulk or stores or "dot_async" not in ttgir:

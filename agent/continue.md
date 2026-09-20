@@ -1,3 +1,34 @@
+# Latest update — 2026-09-19 21:50 UTC
+
+Best SSS run: **1144.3**, normalized **1143.7**, c91 `c758faf`, 692 s.
+The newer c93 `44edf62` scored 1103.3 / normalized 1111.5 in 833 s;
+the extra refinement budget has not established a gain. Keep the best tree.
+
+Current experiments:
+- c94 `9e15bd4`, direct NumPy completion-stamp reads: SSS run
+  `384e1371-67ac-48a7-b460-e23c1762880a`; also dryfter `61cef2a`.
+  All local gates passed; expect negligible score impact, useful as a repeat
+  of c93's tuning behavior. CPU forced-usable alias/reset/fallback checks passed.
+- c95 `0fbb6d7`, TMA weight loads for fused lm_head/argmax, dispatched to
+  Silver Bullet `77f25a5`; isolated worktree `/tmp/fasty-c95`. All local gates,
+  H100 compilation, and descriptor-coordinate emulation passed. GPU descriptor
+  behavior remains to be judged. This variant is not included in c96.
+- c96, incremental sibling membership in `_propose`: identical drafts in 300
+  interpreter cases; all gates pass. New code is six lines; PTX shrank 74% at
+  T=16 and shared memory 1024 -> 32 bytes. Performance remains unmeasured.
+
+Next promising work: refine() must compare an incumbent and challenger freshly,
+not a fresh challenger to a possibly 20-second-old minimum. Hold the incumbent
+CUDA graph and restore it when rejecting a challenger to avoid a recapture.
+This was independently identified by the Claude Code adversarial review.
+
+Public archive upload currently returns HTTP 405; use the authorized GitHub
+push workflow. The documentation-only run `21cb72e2` was canceled before start.
+Do not push documentation alone: every main push triggers an official run.
+Read `agent/EXPERIMENTS.md` for exact validation and dispatch records.
+
+The older notes below are historical where they disagree with this update.
+
 # Continue — Dryft Qwen3 engine
 
 ## State (2026-09-19, ~17:50 UTC)
@@ -16,28 +47,30 @@ at batch 1); c66 1112.9 (warmup bundle: run 815 -> 763 s); **c67 `822ce98`
 1130.6 BEST, 612 s** (TMA descriptor-load GEMM kind + refine on the three
 fastest layouts + runtime COUNT + shared-newline successor table; batch-4 TPOT
 -7%, batch-16 -4%).
-Since c67: c69 canceled at the cap (64-row tiles: reverted); c76 `17e882c`
-1118.8 (normalized 1126.2 = level; batch-1 floor lowered by back-to-back pass
-timing); c67 RERUN `7cfb7f1` 1115.5 (same code as 1130.6: run noise ~1.3%,
-run time 612 vs 709 s); c79 `d25a167` 1114.1 (normalized 1109.4: the
-per-batch EXPECTED_PASSES refit hurt hidden shapes while public-1/2 hit their
-best: reverted in c82; TMA attention option + persistent TMA GEMM kinds kept).
-MEASURING: c80 `2721207` = Programmatic Dependent Launch (kernels/pdl.py:
-`griddepcontrol.wait` first in all 25 kernels + patched Triton launcher +
-warmup self-test with full fallback; published +4-13% on decode). QUEUED: c82
-`f8da493` (+ fused lm_head/argmax refine knob, table reverted). HELD: c83
-`b75e3ef` (pinned-memory completion stamps replace event waits; events remain
-the fallback). Subagent use is now restricted by the user (research on cheaper
-models only when needed); the Exa key file is in the scratchpad (`.exa_key`).
-Research in flight (reports land in `~/.cache/fasty-lab/plan/`):
-whole_system_review.md, triton31_hopper_features.md (source audit: TMA for
-attention K/V tiles, loop prefetch, num_ctas...), web_hopper_triton.md,
-exa_hopper_research.md (Exa API key in the scratchpad file `.exa_key`, user
-supplied; official Triton docs have "TMA in Gluon" and "Warp-Group MMA"
-tutorials). The organisers (Isaac) are raising GPU concurrency: queue waits
-should shrink. A self-scheduled cron tick (every 7 min, session-only) drives
-the loop; forks `john-jpet/fast-transformer` (dryfter, 1123.9 = our c57) and
-`sivakovivan/silver-transformer` copy our main within the hour.
+**BEST: 1140.0 (candidate 85, `53e4a7a`).** Silver Bullet's copy of that tree
+drew 1137.7 and dryfter's dispatch drew 1136.5, so the level is real and all
+three queues are now ours. Leaderboard: SSS 1140.0, Silver Bullet 1137.7,
+dryfter 1136.5, zip 1059.4.
+c85 = PDL off + fused lm_head/argmax knob + pinned-memory completion stamps +
+in-place RoPE tables, on the TMA GEMM kinds. 648 s of the 900 s limit.
+EVERYTHING SINCE HAS BEEN 1.2-1.6% BELOW IT and has been bisected down:
+c86 (plain-decode attention search above batch 16) reverted; c89's third pass
+in flight reverted (it delayed the next sample's prefill: public-1/2 TPOT rose
+1-2%); c87 (pacing pass time = fastest of five back-to-back groups) and c88
+(embedding gather fused into the first norm) measured neutral and stay.
+Measuring: c91 `c758faf` (warp-width knobs for 17-64-row blocks and the
+embedding norm). Queued: c93 `44edf62` (the lookahead revert + refinement
+budget 16 -> 24 s). **If c93 does not come back to ~1135 normalized, the next
+step is to diff `44edf62` against `53e4a7a` and drop c87/c88 too - i.e. return
+to the exact 1140 tree and rebuild from there one change per run.**
+MERGED TEAM: dryfter (`john-jpet/fast-transformer`) and Silver Bullet
+(`sivakovivan/silver-transformer`) are extra run queues; we have push access.
+Dispatch without rewriting their history:
+`git fetch <url> +main:refs/remotes/X/main && git push <url> $(git commit-tree
+<our-sha>^{tree} -p <our-sha> -p X/main -m "...") :refs/heads/main`.
+Their results are visible ONLY as their leaderboard best.
+Dead offline today (no runs spent): alignment hints (no PTX change at all),
+mask-free RMSNorm rewrite (doubles reads per row).
 READ RESULTS WITH `cd agent/tools && python3 collect_runs.py | tail -1 && python3 report_runs.py`:
 one line per run with duration, the node-speed control (native prefill TTFT),
 the NORMALIZED score and public TTFT/TPOT probes. Normalized, c57 1129.7, c58
